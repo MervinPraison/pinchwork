@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str = "pinchwork.db"
+    database_url: str = "data/pinchwork.db"
     host: str = "0.0.0.0"
     port: int = 8000
     initial_credits: int = 100
