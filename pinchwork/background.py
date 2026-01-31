@@ -24,7 +24,7 @@ logger = logging.getLogger("pinchwork.background")
 
 
 async def expire_tasks(session: AsyncSession) -> int:
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
     result = await session.execute(
         select(Task).where(Task.status == TaskStatus.posted, Task.expires_at < now)
     )
@@ -50,7 +50,7 @@ async def auto_approve_tasks(session: AsyncSession) -> int:
     if settings.disable_auto_approve:
         return 0
 
-    cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    cutoff = datetime.now(UTC) - timedelta(hours=24)
     result = await session.execute(
         select(Task).where(
             Task.status == TaskStatus.delivered,
@@ -80,7 +80,7 @@ async def auto_approve_tasks(session: AsyncSession) -> int:
 
 async def expire_matching(session: AsyncSession) -> int:
     """Expire pending matches that passed their deadline, fall back to broadcast."""
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
     result = await session.execute(
         select(Task).where(
             Task.match_status == MatchStatus.pending,
@@ -117,7 +117,7 @@ async def expire_matching(session: AsyncSession) -> int:
 
 async def expire_rejection_grace(session: AsyncSession) -> int:
     """Reset tasks whose rejection grace period has expired back to posted."""
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
     result = await session.execute(
         select(Task).where(
             Task.status == TaskStatus.claimed,
@@ -156,7 +156,7 @@ async def expire_rejection_grace(session: AsyncSession) -> int:
 async def auto_approve_system_tasks(session: AsyncSession) -> int:
     """Auto-approve delivered system tasks after a short window."""
     cutoff_seconds = settings.system_task_auto_approve_seconds
-    cutoff = (datetime.now(UTC) - timedelta(seconds=cutoff_seconds)).isoformat()
+    cutoff = datetime.now(UTC) - timedelta(seconds=cutoff_seconds)
     result = await session.execute(
         select(Task).where(
             Task.is_system == True,  # noqa: E712
@@ -189,7 +189,7 @@ async def expire_deadlines(session: AsyncSession) -> int:
     We handle claimed and posted tasks separately with commits in between
     to prevent a claimed→posted reset from immediately being expired.
     """
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC)
     count = 0
 
     # Claimed tasks past deadline → reset to posted

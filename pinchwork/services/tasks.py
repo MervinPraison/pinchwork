@@ -685,7 +685,7 @@ async def _try_claim(session: AsyncSession, task: Task, worker_id: str) -> dict 
             "UPDATE tasks SET status = 'claimed', worker_id = :worker_id, "
             "claimed_at = :now WHERE id = :id AND status = 'posted'"
         ),
-        {"worker_id": worker_id, "now": datetime.now(UTC).isoformat(), "id": task.id},
+        {"worker_id": worker_id, "now": datetime.now(UTC), "id": task.id},
     )
     if claim_result.rowcount == 0:
         return None
@@ -780,7 +780,7 @@ async def deliver_task(
         {
             "result": result,
             "credits": actual_credits,
-            "now": datetime.now(UTC).isoformat(),
+            "now": datetime.now(UTC),
             "id": tid,
         },
     )
@@ -915,7 +915,7 @@ async def reject_task(
             "rejection_grace_deadline = :grace "
             "WHERE id = :id AND status = 'delivered'"
         ),
-        {"reason": reason, "grace": grace_deadline.isoformat(), "id": tid},
+        {"reason": reason, "grace": grace_deadline, "id": tid},
     )
     if reject_result.rowcount == 0:
         status = status_str(task.status)
@@ -1016,7 +1016,7 @@ async def abandon_task(session: AsyncSession, tid: str, worker_id: str) -> dict:
         raise HTTPException(status_code=403, detail="Not your task")
 
     # Atomic status transition
-    new_expires = (datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)).isoformat()
+    new_expires = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
     abandon_result = await session.execute(
         text(
             "UPDATE tasks SET status = 'posted', worker_id = NULL, claimed_at = NULL, "

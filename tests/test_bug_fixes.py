@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from pinchwork.ids import api_key
@@ -345,3 +347,93 @@ async def test_markdown_starting_with_brace(client):
     assert resp.status_code == 201
     data = resp.json()
     assert data["need"] == "{This is markdown, not JSON}"
+
+
+# --- Bug #14: Background tasks expire future-dated tasks due to isoformat mismatch ---
+
+
+@pytest.mark.asyncio
+async def test_expire_tasks_does_not_expire_future_tasks(db):
+    """Tasks with expires_at in the future should NOT be expired by background loop.
+
+    Regression: background.py used datetime.now(UTC).isoformat() which produces
+    'YYYY-MM-DDTHH:MM:SS+00:00' (T separator), while SQLAlchemy stores datetimes
+    in SQLite as 'YYYY-MM-DD HH:MM:SS' (space separator). In ASCII, space < T,
+    so ALL stored datetimes compared less than the isoformat string, causing every
+    task to appear expired immediately.
+    """
+    from pinchwork.background import expire_deadlines, expire_tasks
+    from pinchwork.db_models import Agent, Task, TaskStatus
+    async with db() as session:
+        # Create a test agent
+        agent = Agent(
+            id="ag-bgtest",
+            name="bg-test",
+            key_hash="FAST$fake",
+            key_fingerprint="fakefp",
+            credits=100,
+        )
+        session.add(agent)
+        await session.flush()
+
+        # Create a task with expires_at 1 hour in the future
+        future_expires = datetime.now(UTC) + timedelta(hours=1)
+        future_deadline = datetime.now(UTC) + timedelta(hours=1)
+        task = Task(
+            id="tk-bgtest1",
+            poster_id="ag-bgtest",
+            need="Should not expire",
+            status=TaskStatus.posted,
+            max_credits=10,
+            expires_at=future_expires,
+            deadline=future_deadline,
+        )
+        session.add(task)
+        await session.commit()
+
+        # Run background expiry — should NOT expire this task
+        expired_count = await expire_tasks(session)
+        assert expired_count == 0, "Task with future expires_at was incorrectly expired"
+
+        deadline_count = await expire_deadlines(session)
+        assert deadline_count == 0, "Task with future deadline was incorrectly expired"
+
+        # Verify task is still posted
+        await session.refresh(task)
+        assert task.status == TaskStatus.posted
+
+
+@pytest.mark.asyncio
+async def test_expire_tasks_does_expire_past_tasks(db):
+    """Tasks with expires_at in the past SHOULD be expired."""
+    from pinchwork.background import expire_tasks
+    from pinchwork.db_models import Agent, Task, TaskStatus
+    async with db() as session:
+        agent = Agent(
+            id="ag-bgtest2",
+            name="bg-test2",
+            key_hash="FAST$fake2",
+            key_fingerprint="fakefp2",
+            credits=100,
+        )
+        session.add(agent)
+        await session.flush()
+
+        # Create a task with expires_at 1 hour in the past
+        past_expires = datetime.now(UTC) - timedelta(hours=1)
+        task = Task(
+            id="tk-bgtest2",
+            poster_id="ag-bgtest2",
+            need="Should expire",
+            status=TaskStatus.posted,
+            max_credits=10,
+            expires_at=past_expires,
+        )
+        session.add(task)
+        await session.commit()
+
+        expired_count = await expire_tasks(session)
+        assert expired_count == 1, "Task with past expires_at was not expired"
+
+        await session.refresh(task)
+        assert task.status == TaskStatus.expired
