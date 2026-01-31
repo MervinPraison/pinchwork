@@ -266,8 +266,12 @@ async def background_loop(session_factory: sessionmaker) -> None:
                 grace_expired = await expire_rejection_grace(session)
                 deadline_expired = await expire_deadlines(session)
                 any_work = (
-                    expired or approved or match_expired
-                    or sys_approved or grace_expired or deadline_expired
+                    expired
+                    or approved
+                    or match_expired
+                    or sys_approved
+                    or grace_expired
+                    or deadline_expired
                 )
                 if any_work:
                     logger.info(

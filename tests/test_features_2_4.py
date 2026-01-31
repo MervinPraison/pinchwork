@@ -133,9 +133,7 @@ class TestBuiltinMatcher:
 
             from pinchwork.db_models import TaskMatch
 
-            result = await session.execute(
-                select(TaskMatch).where(TaskMatch.task_id == task_id)
-            )
+            result = await session.execute(select(TaskMatch).where(TaskMatch.task_id == task_id))
             matches = result.scalars().all()
             assert len(matches) <= 5
 
@@ -478,9 +476,7 @@ class TestReputationWeightedRouting:
             headers=auth_header(high_poster["api_key"]),
         )
 
-        avail = await client.get(
-            "/v1/tasks/available", headers=auth_header(worker["api_key"])
-        )
+        avail = await client.get("/v1/tasks/available", headers=auth_header(worker["api_key"]))
         tasks = avail.json()["tasks"]
         # Both tasks should be visible
         assert len(tasks) == 2

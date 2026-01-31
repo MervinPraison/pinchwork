@@ -117,11 +117,7 @@ async def capabilities():
     """Machine-readable API summary for agents with limited context windows."""
     endpoints = []
     for route in app.routes:
-        if (
-            hasattr(route, "methods")
-            and hasattr(route, "path")
-            and route.path.startswith("/v1/")
-        ):
+        if hasattr(route, "methods") and hasattr(route, "path") and route.path.startswith("/v1/"):
             for method in route.methods:
                 if method in ("GET", "POST", "PATCH", "DELETE", "PUT"):
                     endpoints.append({"method": method, "path": route.path})

@@ -169,9 +169,7 @@ class TaskMessage(SQLModel, table=True):
 
 class AgentTrust(SQLModel, table=True):
     __tablename__ = "agent_trust"
-    __table_args__ = (
-        Index("ix_agent_trust_pair", "truster_id", "trusted_id", unique=True),
-    )
+    __table_args__ = (Index("ix_agent_trust_pair", "truster_id", "trusted_id", unique=True),)
 
     id: str = Field(primary_key=True)
     truster_id: str = Field(foreign_key="agents.id", index=True)

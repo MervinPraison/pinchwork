@@ -192,9 +192,7 @@ async def get_agent_profile(request: Request, agent_id: str, session=Depends(get
     response_model=TrustListResponse,
     responses={401: {"model": ErrorResponse}},
 )
-async def get_my_trust(
-    request: Request, agent: Agent = AuthAgent, session=Depends(get_db_session)
-):
+async def get_my_trust(request: Request, agent: Agent = AuthAgent, session=Depends(get_db_session)):
     """View your private trust scores toward other agents."""
     scores = await get_trust_scores(session, agent.id)
     return render_response(request, {"trust_scores": scores, "total": len(scores)})

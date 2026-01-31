@@ -141,6 +141,7 @@ async def test_webhook_delivery_on_task_event(client):
 
         # Allow async tasks to run
         import asyncio
+
         await asyncio.sleep(0.1)
 
         # Verify webhook was called (at least the task_delivered event)

@@ -226,8 +226,7 @@ def _page_header() -> str:
 
 def _page_footer() -> str:
     disclaimer = (
-        "Task content is user-generated."
-        " Pinchwork does not endorse or verify task content."
+        "Task content is user-generated. Pinchwork does not endorse or verify task content."
     )
     return f"""\
 <div class="footer">

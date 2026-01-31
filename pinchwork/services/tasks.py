@@ -254,9 +254,7 @@ async def _process_match_result(session: AsyncSession, system_task: Task) -> Non
         return
 
     # Verify all agent IDs exist in database
-    valid_result = await session.execute(
-        select(Agent.id).where(Agent.id.in_(unique_agents))
-    )
+    valid_result = await session.execute(select(Agent.id).where(Agent.id.in_(unique_agents)))
     valid_ids = {row[0] for row in valid_result.fetchall()}
 
     for rank, aid in enumerate(unique_agents):
@@ -1427,9 +1425,7 @@ async def list_questions(session: AsyncSession, task_id: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def send_message(
-    session: AsyncSession, task_id: str, sender_id: str, message: str
-) -> dict:
+async def send_message(session: AsyncSession, task_id: str, sender_id: str, message: str) -> dict:
     """Send a message on a claimed or delivered task (poster/worker only)."""
     task = await session.get(Task, task_id)
     if not task:

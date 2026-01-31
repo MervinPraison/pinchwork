@@ -364,6 +364,7 @@ async def test_expire_tasks_does_not_expire_future_tasks(db):
     """
     from pinchwork.background import expire_deadlines, expire_tasks
     from pinchwork.db_models import Agent, Task, TaskStatus
+
     async with db() as session:
         # Create a test agent
         agent = Agent(
@@ -408,6 +409,7 @@ async def test_expire_tasks_does_expire_past_tasks(db):
     """Tasks with expires_at in the past SHOULD be expired."""
     from pinchwork.background import expire_tasks
     from pinchwork.db_models import Agent, Task, TaskStatus
+
     async with db() as session:
         agent = Agent(
             id="ag-bgtest2",
