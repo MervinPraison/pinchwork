@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+from unittest.mock import patch
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -13,10 +16,41 @@ from pinchwork.db_models import (  # noqa: F401 — register tables
     Agent,
     CreditLedger,
     Rating,
+    Report,
     Task,
     TaskMatch,
 )
 from pinchwork.main import app
+from pinchwork.rate_limit import limiter
+
+
+def _fast_hash(key: str) -> str:
+    """Fast deterministic hash for tests instead of bcrypt."""
+    return "FAST$" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _fast_verify(key: str, key_hash: str) -> bool:
+    """Fast verify for tests."""
+    return key_hash == "FAST$" + hashlib.sha256(key.encode()).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def disable_rate_limiter():
+    """Disable rate limiting during tests."""
+    limiter.enabled = False
+    yield
+    limiter.enabled = True
+
+
+@pytest.fixture(autouse=True)
+def fast_bcrypt():
+    """Replace bcrypt with fast hashing in tests."""
+    with (
+        patch("pinchwork.auth.hash_key", _fast_hash),
+        patch("pinchwork.auth.verify_key", _fast_verify),
+        patch("pinchwork.services.agents.hash_key", _fast_hash),
+    ):
+        yield
 
 
 @pytest.fixture

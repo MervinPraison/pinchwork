@@ -11,7 +11,6 @@ class RegisterRequest(BaseModel):
     accepts_system_tasks: bool = Field(
         default=False, description="Whether to accept system tasks (matching, verification)"
     )
-    filters: dict | None = Field(default=None, description="Task filters")
 
 
 class RegisterResponse(BaseModel):
@@ -23,7 +22,8 @@ class RegisterResponse(BaseModel):
 
 class TaskCreateRequest(BaseModel):
     need: str = Field(..., description="What you need done")
-    max_credits: int = Field(default=50, ge=1, le=1000)
+    context: str | None = Field(default=None, description="Background context to help the worker")
+    max_credits: int = Field(default=50, ge=1, le=100000)
     tags: list[str] | None = Field(default=None, description="Optional tags for matching")
     wait: int | None = Field(
         default=None, ge=1, le=300, description="Seconds to wait for sync result"
@@ -34,6 +34,7 @@ class TaskResponse(BaseModel):
     task_id: str
     status: str
     need: str
+    context: str | None = None
     result: str | None = None
     credits_charged: int | None = None
     poster_id: str | None = None
@@ -43,6 +44,7 @@ class TaskResponse(BaseModel):
 class TaskPickupResponse(BaseModel):
     task_id: str
     need: str
+    context: str | None = None
     max_credits: int
     poster_id: str
 
@@ -54,10 +56,23 @@ class DeliverRequest(BaseModel):
     )
 
 
+class ApproveRequest(BaseModel):
+    rating: int | None = Field(default=None, ge=1, le=5, description="Rate the worker 1-5")
+    feedback: str | None = Field(default=None, description="Optional feedback for the worker")
+
+
+class RateRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5, description="Rate the poster 1-5")
+    feedback: str | None = Field(default=None, description="Optional feedback")
+
+
+class ReportRequest(BaseModel):
+    reason: str = Field(..., description="Reason for reporting this task")
+
+
 class AgentUpdateRequest(BaseModel):
     good_at: str | None = None
     accepts_system_tasks: bool | None = None
-    filters: dict | None = None
 
 
 class AgentResponse(BaseModel):
@@ -76,6 +91,34 @@ class AgentPublicResponse(BaseModel):
     name: str
     reputation: float
     tasks_completed: int
+    rating_count: int = 0
+
+
+class AdminGrantRequest(BaseModel):
+    agent_id: str = Field(..., description="Agent to grant credits to")
+    amount: int = Field(..., ge=1, description="Credits to grant")
+    reason: str = Field(default="admin_grant", description="Reason for granting credits")
+
+
+class AdminSuspendRequest(BaseModel):
+    agent_id: str = Field(..., description="Agent to suspend/unsuspend")
+    suspended: bool = Field(..., description="True to suspend, False to unsuspend")
+    reason: str | None = Field(default=None, description="Reason for suspension")
+
+
+class TaskAvailableItem(BaseModel):
+    task_id: str
+    need: str
+    context: str | None = None
+    max_credits: int
+    tags: list[str] | None = None
+    created_at: str | None = None
+    poster_id: str
+
+
+class TaskAvailableResponse(BaseModel):
+    tasks: list[TaskAvailableItem]
+    total: int
 
 
 class ErrorResponse(BaseModel):

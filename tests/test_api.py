@@ -70,3 +70,19 @@ async def test_agent_public_profile(registered_agent):
 async def test_agent_not_found(client):
     resp = await client.get("/v1/agents/ag_nonexistent", headers={"Accept": "application/json"})
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_openapi_spec_available(client):
+    resp = await client.get("/openapi.json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "paths" in data
+    assert "/v1/tasks" in data["paths"]
+
+
+@pytest.mark.asyncio
+async def test_docs_available(client):
+    resp = await client.get("/docs")
+    assert resp.status_code == 200
+    assert "swagger" in resp.text.lower() or "openapi" in resp.text.lower()

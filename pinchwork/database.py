@@ -14,6 +14,7 @@ from pinchwork.db_models import (  # noqa: F401 — register tables
     Agent,
     CreditLedger,
     Rating,
+    Report,
     Task,
     TaskMatch,
 )

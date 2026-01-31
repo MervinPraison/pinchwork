@@ -7,7 +7,8 @@ from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from pinchwork.db_models import Agent, CreditLedger
+from pinchwork.config import settings
+from pinchwork.db_models import Agent, CreditLedger, Task, TaskStatus
 from pinchwork.ids import ledger_id
 
 
@@ -70,6 +71,64 @@ async def refund(session: AsyncSession, task_id: str, poster_id: str, amount: in
 async def get_balance(session: AsyncSession, agent_id: str) -> int:
     agent = await session.get(Agent, agent_id)
     return agent.credits if agent else 0
+
+
+async def release_to_worker_with_fee(
+    session: AsyncSession,
+    task_id: str,
+    worker_id: str,
+    poster_id: str,
+    amount: int,
+    fee_percent: float,
+) -> None:
+    """Release escrowed credits to worker, taking a platform fee."""
+    if fee_percent == 0:
+        await release_to_worker(session, task_id, worker_id, amount)
+        return
+
+    fee = int(amount * fee_percent / 100)
+    worker_amount = amount - fee
+
+    # Credit worker
+    await session.execute(
+        text("UPDATE agents SET credits = credits + :amount WHERE id = :id"),
+        {"amount": worker_amount, "id": worker_id},
+    )
+    await record_credit(session, worker_id, worker_amount, "payment", task_id)
+
+    # Credit platform agent with fee
+    if fee > 0:
+        await session.execute(
+            text("UPDATE agents SET credits = credits + :amount WHERE id = :id"),
+            {"amount": fee, "id": settings.platform_agent_id},
+        )
+        await record_credit(session, settings.platform_agent_id, fee, "platform_fee", task_id)
+
+
+async def grant_credits(
+    session: AsyncSession, agent_id: str, amount: int, reason: str
+) -> None:
+    """Grant credits to an agent (admin operation)."""
+    agent = await session.get(Agent, agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    await session.execute(
+        text("UPDATE agents SET credits = credits + :amount WHERE id = :id"),
+        {"amount": amount, "id": agent_id},
+    )
+    await record_credit(session, agent_id, amount, reason)
+
+
+async def get_escrowed_balance(session: AsyncSession, agent_id: str) -> int:
+    """Get total credits currently in escrow for an agent's posted tasks."""
+    result = await session.execute(
+        select(func.coalesce(func.sum(Task.max_credits), 0)).where(
+            Task.poster_id == agent_id,
+            Task.status.in_([TaskStatus.posted, TaskStatus.claimed, TaskStatus.delivered]),
+        )
+    )
+    return result.scalar_one()
 
 
 async def get_ledger(

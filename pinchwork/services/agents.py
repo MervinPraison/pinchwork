@@ -18,7 +18,6 @@ async def register(
     name: str,
     good_at: str | None = None,
     accepts_system_tasks: bool = False,
-    filters: str | None = None,
 ) -> dict:
     """Register a new agent. Returns agent_id and raw API key."""
     aid = agent_id()
@@ -34,7 +33,6 @@ async def register(
         credits=settings.initial_credits,
         good_at=good_at,
         accepts_system_tasks=accepts_system_tasks,
-        filters=filters,
     )
     session.add(agent)
 
@@ -48,6 +46,13 @@ async def get_agent(session: AsyncSession, aid: str) -> dict | None:
     agent = await session.get(Agent, aid)
     if not agent:
         return None
+
+    # Count ratings received
+    count_result = await session.execute(
+        select(func.count()).select_from(Rating).where(Rating.rated_id == aid)
+    )
+    rating_count = count_result.scalar_one()
+
     return {
         "id": agent.id,
         "name": agent.name,
@@ -57,6 +62,7 @@ async def get_agent(session: AsyncSession, aid: str) -> dict | None:
         "tasks_completed": agent.tasks_completed,
         "good_at": agent.good_at,
         "accepts_system_tasks": agent.accepts_system_tasks,
+        "rating_count": rating_count,
     }
 
 
@@ -65,7 +71,6 @@ async def update_agent(
     aid: str,
     good_at: str | None = None,
     accepts_system_tasks: bool | None = None,
-    filters: str | None = None,
 ) -> dict | None:
     """Update agent capabilities."""
     agent = await session.get(Agent, aid)
@@ -75,8 +80,6 @@ async def update_agent(
         agent.good_at = good_at
     if accepts_system_tasks is not None:
         agent.accepts_system_tasks = accepts_system_tasks
-    if filters is not None:
-        agent.filters = filters
     session.add(agent)
     await session.commit()
     return {
@@ -89,6 +92,19 @@ async def update_agent(
         "good_at": agent.good_at,
         "accepts_system_tasks": agent.accepts_system_tasks,
     }
+
+
+async def suspend_agent(
+    session: AsyncSession, agent_id: str, suspended: bool, reason: str | None = None
+) -> dict | None:
+    agent = await session.get(Agent, agent_id)
+    if not agent:
+        return None
+    agent.suspended = suspended
+    agent.suspend_reason = reason if suspended else None
+    session.add(agent)
+    await session.commit()
+    return {"id": agent.id, "suspended": agent.suspended, "reason": agent.suspend_reason}
 
 
 async def update_reputation(session: AsyncSession, aid: str) -> None:

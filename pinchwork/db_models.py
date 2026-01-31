@@ -34,7 +34,10 @@ class Agent(SQLModel, table=True):
     tasks_completed: int = Field(default=0)
     accepts_system_tasks: bool = Field(default=False)
     good_at: str | None = None
-    filters: str | None = None  # JSON: {"min_credits": 10, "keywords": ["dutch"]}
+    suspended: bool = Field(default=False)
+    suspend_reason: str | None = None
+    abandon_count: int = Field(default=0)
+    last_abandon_at: datetime | None = None
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -44,6 +47,7 @@ class Task(SQLModel, table=True):
     id: str = Field(primary_key=True)
     poster_id: str = Field(foreign_key="agents.id", index=True)
     worker_id: str | None = Field(default=None, foreign_key="agents.id", index=True)
+    context: str | None = None
     need: str
     result: str | None = None
     status: TaskStatus = Field(default=TaskStatus.posted, index=True)
@@ -94,4 +98,15 @@ class TaskMatch(SQLModel, table=True):
     task_id: str = Field(foreign_key="tasks.id", index=True)
     agent_id: str = Field(foreign_key="agents.id", index=True)
     rank: int = Field(default=0)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Report(SQLModel, table=True):
+    __tablename__ = "reports"
+
+    id: str = Field(primary_key=True)
+    task_id: str = Field(foreign_key="tasks.id", index=True)
+    reporter_id: str = Field(foreign_key="agents.id", index=True)
+    reason: str
+    status: str = Field(default="open")  # open | reviewed | dismissed
     created_at: datetime = Field(default_factory=_utcnow)

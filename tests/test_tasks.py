@@ -62,7 +62,7 @@ async def test_full_cycle_json(two_agents):
 
     # Check worker earned credits
     resp = await c.get("/v1/me", headers=hdr(worker["key"]))
-    assert resp.json()["credits"] == 110  # 100 + 10 earned
+    assert resp.json()["credits"] == 109  # 100 + 10 earned - 1 platform fee (10%)
 
 
 @pytest.mark.asyncio
@@ -210,3 +210,347 @@ async def test_task_visibility(two_agents):
     # Outsider can't see it
     resp = await c.get(f"/v1/tasks/{task_id}", headers=hdr(outsider_key))
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Context field tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_context(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={
+            "need": "Translate to Dutch",
+            "context": "This is for a legal document",
+            "max_credits": 10,
+        },
+    )
+    assert resp.status_code == 201
+
+    # Pickup should include context
+    resp = await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["context"] == "This is for a legal document"
+
+
+@pytest.mark.asyncio
+async def test_pickup_includes_context(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Do work", "context": "Important background", "max_credits": 5},
+    )
+    task_id = resp.json()["task_id"]
+
+    # Poll should include context
+    resp = await c.get(f"/v1/tasks/{task_id}", headers=hdr(poster["key"]))
+    assert resp.json()["context"] == "Important background"
+
+
+@pytest.mark.asyncio
+async def test_context_optional(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "No context task", "max_credits": 5},
+    )
+    assert resp.status_code == 201
+    task_id = resp.json()["task_id"]
+
+    resp = await c.get(f"/v1/tasks/{task_id}", headers=hdr(poster["key"]))
+    assert resp.json()["context"] is None
+
+
+# ---------------------------------------------------------------------------
+# Browse available tasks tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browse_empty(registered_agent):
+    client, _, api_key = registered_agent
+    resp = await client.get("/v1/tasks/available", headers=hdr(api_key))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["tasks"] == []
+    assert data["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_browse_basic(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    # Post a task
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Browse me", "max_credits": 5},
+    )
+    assert resp.status_code == 201
+
+    # Worker browses
+    resp = await c.get("/v1/tasks/available", headers=hdr(worker["key"]))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["tasks"][0]["need"] == "Browse me"
+
+
+@pytest.mark.asyncio
+async def test_browse_excludes_own_tasks(registered_agent):
+    client, _, api_key = registered_agent
+
+    resp = await client.post(
+        "/v1/tasks",
+        headers=jhdr(api_key),
+        json={"need": "My own task", "max_credits": 5},
+    )
+    assert resp.status_code == 201
+
+    resp = await client.get("/v1/tasks/available", headers=hdr(api_key))
+    assert resp.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_browse_excludes_system_tasks(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    # Register an infra agent so system tasks get created
+    resp = await c.post(
+        "/v1/register",
+        json={"name": "infra", "accepts_system_tasks": True},
+        headers={"Accept": "application/json"},
+    )
+    # Post a task (will spawn a system matching task)
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Regular task", "max_credits": 5},
+    )
+    assert resp.status_code == 201
+
+    # Worker browse should not show system tasks
+    resp = await c.get("/v1/tasks/available", headers=hdr(worker["key"]))
+    data = resp.json()
+    for task in data["tasks"]:
+        assert "Match agents" not in task["need"]
+
+
+@pytest.mark.asyncio
+async def test_browse_pagination(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    # Post 3 tasks
+    for i in range(3):
+        await c.post(
+            "/v1/tasks",
+            headers=jhdr(poster["key"]),
+            json={"need": f"Task {i}", "max_credits": 5},
+        )
+
+    resp = await c.get("/v1/tasks/available?limit=2&offset=0", headers=hdr(worker["key"]))
+    data = resp.json()
+    assert data["total"] == 3
+    assert len(data["tasks"]) == 2
+
+    resp = await c.get("/v1/tasks/available?limit=2&offset=2", headers=hdr(worker["key"]))
+    data = resp.json()
+    assert data["total"] == 3
+    assert len(data["tasks"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_browse_tag_filtering(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Dutch task", "max_credits": 5, "tags": ["dutch"]},
+    )
+    await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "French task", "max_credits": 5, "tags": ["french"]},
+    )
+
+    resp = await c.get("/v1/tasks/available?tags=dutch", headers=hdr(worker["key"]))
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["tasks"][0]["need"] == "Dutch task"
+
+
+@pytest.mark.asyncio
+async def test_browse_includes_context(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Task with ctx", "context": "Some background", "max_credits": 5},
+    )
+
+    resp = await c.get("/v1/tasks/available", headers=hdr(worker["key"]))
+    data = resp.json()
+    assert data["tasks"][0]["context"] == "Some background"
+
+
+# ---------------------------------------------------------------------------
+# Abandon task tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_abandon_happy_path(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Abandon me", "max_credits": 10},
+    )
+    task_id = resp.json()["task_id"]
+
+    # Pickup
+    await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+
+    # Abandon
+    resp = await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(worker["key"]))
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "posted"
+    assert data["worker_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_abandon_sets_broadcast(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Broadcast after abandon", "max_credits": 5},
+    )
+    task_id = resp.json()["task_id"]
+
+    await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+    await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(worker["key"]))
+
+    # Task should be available again for browse
+    resp = await c.get("/v1/tasks/available", headers=hdr(worker["key"]))
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["tasks"][0]["task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_abandon_wrong_agent(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Not yours", "max_credits": 5},
+    )
+    task_id = resp.json()["task_id"]
+
+    await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+
+    # Poster tries to abandon (not the worker)
+    resp = await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(poster["key"]))
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_abandon_wrong_status(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Still posted", "max_credits": 5},
+    )
+    task_id = resp.json()["task_id"]
+
+    # Try to abandon a posted (not claimed) task
+    resp = await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(worker["key"]))
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_abandon_no_credit_penalty(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    # Check worker starting credits
+    resp = await c.get("/v1/me", headers=hdr(worker["key"]))
+    start_credits = resp.json()["credits"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Free abandon", "max_credits": 10},
+    )
+    task_id = resp.json()["task_id"]
+
+    await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+    await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(worker["key"]))
+
+    # Worker credits unchanged
+    resp = await c.get("/v1/me", headers=hdr(worker["key"]))
+    assert resp.json()["credits"] == start_credits
+
+
+@pytest.mark.asyncio
+async def test_abandon_refreshes_expiry(two_agents):
+    c = two_agents["client"]
+    poster = two_agents["poster"]
+    worker = two_agents["worker"]
+
+    resp = await c.post(
+        "/v1/tasks",
+        headers=jhdr(poster["key"]),
+        json={"need": "Expiry test", "max_credits": 5},
+    )
+    task_id = resp.json()["task_id"]
+
+    await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
+    await c.post(f"/v1/tasks/{task_id}/abandon", headers=hdr(worker["key"]))
+
+    # Task should be back to posted and available for pickup
+    resp = await c.get(f"/v1/tasks/{task_id}", headers=hdr(poster["key"]))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "posted"

@@ -2,40 +2,39 @@
 
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, Depends, Request
 
-from pinchwork.auth import AuthAgent
+from pinchwork.auth import AuthAgent, verify_admin_key
+from pinchwork.config import settings
 from pinchwork.content import parse_body, render_response
 from pinchwork.database import get_db_session
 from pinchwork.db_models import Agent
 from pinchwork.models import (
+    AdminSuspendRequest,
     AgentPublicResponse,
     AgentResponse,
     AgentUpdateRequest,
     RegisterResponse,
 )
-from pinchwork.services.agents import get_agent, register, update_agent
+from pinchwork.rate_limit import limiter
+from pinchwork.services.agents import get_agent, register, suspend_agent, update_agent
 
 router = APIRouter()
 
 
 @router.post("/v1/register")
+@limiter.limit(settings.rate_limit_register)
 async def register_agent(request: Request, session=Depends(get_db_session)):
     body = await parse_body(request)
     name = body.get("name", "anonymous")
     good_at = body.get("good_at")
     accepts_system_tasks = body.get("accepts_system_tasks", False)
-    filters_raw = body.get("filters")
-    filters_json = json.dumps(filters_raw) if filters_raw else None
 
     result = await register(
         session,
         name,
         good_at=good_at,
         accepts_system_tasks=accepts_system_tasks,
-        filters=filters_json,
     )
 
     return render_response(
@@ -74,13 +73,11 @@ async def update_me(request: Request, agent: Agent = AuthAgent, session=Depends(
     except Exception:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
-    filters_json = json.dumps(update.filters) if update.filters is not None else None
     result = await update_agent(
         session,
         agent.id,
         good_at=update.good_at,
         accepts_system_tasks=update.accepts_system_tasks,
-        filters=filters_json,
     )
     if not result:
         return render_response(request, {"error": "Agent not found"}, status_code=404)
@@ -113,5 +110,24 @@ async def get_agent_profile(request: Request, agent_id: str, session=Depends(get
             name=agent["name"],
             reputation=agent["reputation"],
             tasks_completed=agent["tasks_completed"],
+            rating_count=agent.get("rating_count", 0),
         ),
     )
+
+
+@router.post("/v1/admin/agents/suspend")
+async def admin_suspend(
+    request: Request,
+    _=Depends(verify_admin_key),
+    session=Depends(get_db_session),
+):
+    body = await parse_body(request)
+    try:
+        req = AdminSuspendRequest(**body)
+    except Exception:
+        return render_response(request, {"error": "Invalid request body"}, status_code=400)
+
+    result = await suspend_agent(session, req.agent_id, req.suspended, req.reason)
+    if not result:
+        return render_response(request, {"error": "Agent not found"}, status_code=404)
+    return render_response(request, result)

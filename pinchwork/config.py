@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     platform_agent_id: str = "ag_platform"
     match_credits: int = 3
     verify_credits: int = 5
+    platform_fee_percent: float = 10.0
+    admin_key: str | None = None
+    disable_auto_approve: bool = False
+    max_abandons_before_cooldown: int = 5
+    abandon_cooldown_minutes: int = 30
+    rate_limit_register: str = "5/hour"
+    rate_limit_create: str = "30/minute"
+    rate_limit_pickup: str = "60/minute"
+    rate_limit_deliver: str = "30/minute"
 
     model_config = {"env_prefix": "PINCHWORK_"}
 

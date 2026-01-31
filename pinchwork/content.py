@@ -106,6 +106,7 @@ def render_task_result(
         "task_id": task["id"],
         "status": task["status"],
         "need": task.get("need", ""),
+        "context": task.get("context"),
         "result": task.get("result"),
         "credits_charged": task.get("credits_charged"),
         "poster_id": task.get("poster_id"),

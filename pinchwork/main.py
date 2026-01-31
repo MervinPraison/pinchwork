@@ -10,11 +10,13 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
+from slowapi.middleware import SlowAPIMiddleware
 
 from pinchwork.api.router import api_router
 from pinchwork.background import background_loop
 from pinchwork.config import settings
 from pinchwork.database import close_db, get_session_factory, init_db
+from pinchwork.rate_limit import limiter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pinchwork")
@@ -48,6 +50,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(api_router)
 

@@ -510,3 +510,222 @@ async def test_system_task_auto_approved_on_delivery(client, db):
         task = await session.get(Task, sys_id)
         status = task.status.value if isinstance(task.status, TaskStatus) else task.status
         assert status == "approved"
+
+
+# ---------------------------------------------------------------------------
+# Browse, context, and abandon: end-to-end integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browse_pickup_abandon_cycle(client, db):
+    """End-to-end: browse → pickup → abandon → browse again (task reappears)."""
+    poster = await _reg(client, "poster")
+    worker = await _reg(client, "worker", good_at="Dutch translation")
+
+    # 1. Create task with context
+    resp = await client.post(
+        "/v1/tasks",
+        json={
+            "need": "Translate annual report",
+            "context": "Financial document, formal tone",
+            "max_credits": 20,
+            "tags": ["dutch", "finance"],
+        },
+        headers=auth_header(poster["api_key"]),
+    )
+    assert resp.status_code == 201
+    task_id = resp.json()["task_id"]
+
+    # 2. Worker browses available tasks
+    resp = await client.get(
+        "/v1/tasks/available?tags=dutch",
+        headers=auth_header(worker["api_key"]),
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["tasks"][0]["task_id"] == task_id
+    assert data["tasks"][0]["context"] == "Financial document, formal tone"
+    assert data["tasks"][0]["tags"] == ["dutch", "finance"]
+
+    # 3. Worker picks up the task
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
+    assert resp.status_code == 200
+    picked = resp.json()
+    assert picked["task_id"] == task_id
+    assert picked["context"] == "Financial document, formal tone"
+
+    # 4. Task no longer appears in browse
+    resp = await client.get(
+        "/v1/tasks/available",
+        headers=auth_header(worker["api_key"]),
+    )
+    assert resp.json()["total"] == 0
+
+    # 5. Worker abandons (can't handle it)
+    resp = await client.post(
+        f"/v1/tasks/{task_id}/abandon",
+        headers=auth_header(worker["api_key"]),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "posted"
+
+    # 6. Task reappears in browse
+    resp = await client.get(
+        "/v1/tasks/available",
+        headers=auth_header(worker["api_key"]),
+    )
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["tasks"][0]["task_id"] == task_id
+
+    # 7. Worker credits unchanged (no penalty for abandon)
+    resp = await client.get("/v1/me", headers=auth_header(worker["api_key"]))
+    assert resp.json()["credits"] == 100
+
+    # 8. Another worker can pick it up
+    worker2 = await _reg(client, "worker2", good_at="Dutch finance")
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker2["api_key"]))
+    assert resp.status_code == 200
+    assert resp.json()["task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_context_flows_through_matching_and_verification(client, db):
+    """Context is included in matching and verification system task prompts."""
+    infra = await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
+    worker = await _reg(client, "worker", good_at="Dutch translation")
+    poster = await _reg(client, "poster")
+
+    # Create task with context
+    resp = await client.post(
+        "/v1/tasks",
+        json={
+            "need": "Translate legal clause",
+            "context": "Contract for Dutch healthcare provider",
+            "max_credits": 15,
+        },
+        headers=auth_header(poster["api_key"]),
+    )
+    assert resp.status_code == 201
+    task_id = resp.json()["task_id"]
+
+    # Infra picks up match task — should contain context
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+    assert resp.status_code == 200
+    assert "Contract for Dutch healthcare provider" in resp.json()["need"]
+
+    # Deliver match result
+    match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
+    await client.post(
+        f"/v1/tasks/{resp.json()['task_id']}/deliver",
+        json={"result": match_result},
+        headers=auth_header(infra["api_key"]),
+    )
+
+    # Worker picks up and delivers
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
+    assert resp.json()["task_id"] == task_id
+    assert resp.json()["context"] == "Contract for Dutch healthcare provider"
+    await client.post(
+        f"/v1/tasks/{task_id}/deliver",
+        json={"result": "Vertaling van juridische clausule"},
+        headers=auth_header(worker["api_key"]),
+    )
+
+    # Infra picks up verification — should contain context
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+    assert resp.status_code == 200
+    verify_need = resp.json()["need"]
+    assert "Verify completion" in verify_need
+    assert "Contract for Dutch healthcare provider" in verify_need
+
+
+@pytest.mark.asyncio
+async def test_browse_conflict_exclusion(client, db):
+    """Agents who did system work on a task don't see it in browse."""
+    infra = await _reg(client, "infra", good_at="matching, Dutch", accepts_system_tasks=True)
+    poster = await _reg(client, "poster")
+
+    # Create task
+    resp = await client.post(
+        "/v1/tasks",
+        json={"need": "Browse conflict test", "max_credits": 5},
+        headers=auth_header(poster["api_key"]),
+    )
+    task_id = resp.json()["task_id"]
+
+    # Infra matches the task (does system work)
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+    sys_id = resp.json()["task_id"]
+    match = json.dumps({"ranked_agents": [infra["agent_id"]]})
+    await client.post(
+        f"/v1/tasks/{sys_id}/deliver",
+        json={"result": match},
+        headers=auth_header(infra["api_key"]),
+    )
+
+    # Infra should NOT see the task in browse (conflict rule)
+    resp = await client.get("/v1/tasks/available", headers=auth_header(infra["api_key"]))
+    task_ids = [t["task_id"] for t in resp.json()["tasks"]]
+    assert task_id not in task_ids
+
+
+@pytest.mark.asyncio
+async def test_browse_matched_tasks_first(client, db):
+    """Matched tasks appear before broadcast tasks in browse results."""
+    infra = await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
+    worker = await _reg(client, "worker", good_at="Dutch translation")
+    poster = await _reg(client, "poster")
+
+    # Create first task — will become broadcast after match expiry
+    resp = await client.post(
+        "/v1/tasks",
+        json={"need": "Broadcast task", "max_credits": 5},
+        headers=auth_header(poster["api_key"]),
+    )
+    broadcast_id = resp.json()["task_id"]
+
+    # Process match for first task — match nobody useful, then expire to broadcast
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+    sys_id = resp.json()["task_id"]
+    match_result = json.dumps({"ranked_agents": []})
+    await client.post(
+        f"/v1/tasks/{sys_id}/deliver",
+        json={"result": match_result},
+        headers=auth_header(infra["api_key"]),
+    )
+
+    # Force broadcast by expiring match deadline
+    async with db() as session:
+        task = await session.get(Task, broadcast_id)
+        task.match_status = "broadcast"
+        session.add(task)
+        await session.commit()
+
+    # Create second task — match to our worker
+    resp = await client.post(
+        "/v1/tasks",
+        json={"need": "Matched task", "max_credits": 5},
+        headers=auth_header(poster["api_key"]),
+    )
+    matched_id = resp.json()["task_id"]
+
+    # Process match for second task — match our worker
+    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+    sys_id = resp.json()["task_id"]
+    match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
+    await client.post(
+        f"/v1/tasks/{sys_id}/deliver",
+        json={"result": match_result},
+        headers=auth_header(infra["api_key"]),
+    )
+
+    # Worker browses — matched task should come first, broadcast second
+    resp = await client.get("/v1/tasks/available", headers=auth_header(worker["api_key"]))
+    data = resp.json()
+    assert data["total"] == 2
+    task_ids = [t["task_id"] for t in data["tasks"]]
+    assert task_ids[0] == matched_id
+    assert task_ids[1] == broadcast_id

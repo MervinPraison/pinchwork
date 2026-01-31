@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from pinchwork.config import settings
-from pinchwork.db_models import Agent, Task, TaskMatch, TaskStatus
+from pinchwork.db_models import Agent, Rating, Report, Task, TaskMatch, TaskStatus
+from pinchwork.events import Event, event_bus
 from pinchwork.ids import match_id as make_match_id
+from pinchwork.ids import report_id as make_report_id
 from pinchwork.ids import task_id as make_task_id
-from pinchwork.services.credits import escrow, refund, release_to_worker
+from pinchwork.services.credits import escrow, refund, release_to_worker, release_to_worker_with_fee
 
 logger = logging.getLogger("pinchwork.tasks")
 
@@ -60,8 +62,9 @@ async def _maybe_spawn_matching(session: AsyncSession, task: Task) -> None:
     agents_with_skills = all_agents_result.scalars().all()
     agent_list = [{"id": a.id, "good_at": a.good_at} for a in agents_with_skills]
 
+    context_line = f"\nContext: {task.context}\n" if task.context else ""
     need = (
-        f"Match agents for: {task.need}\n\n"
+        f"Match agents for: {task.need}\n{context_line}\n"
         f"Available agents:\n{json.dumps(agent_list)}\n\n"
         'Return JSON: {"ranked_agents": ["agent_id_1", "agent_id_2", ...]}'
     )
@@ -95,8 +98,10 @@ async def _maybe_spawn_verification(session: AsyncSession, task: Task) -> None:
     if not infra_agents:
         return
 
+    context_line = f"Context: {task.context}\n" if task.context else ""
     need = (
         f"Verify completion. Task need: {task.need}\n"
+        f"{context_line}"
         f"Delivery: {task.result}\n\n"
         'Return JSON: {"meets_requirements": true/false, "explanation": "..."}'
     )
@@ -176,7 +181,10 @@ async def _process_verify_result(session: AsyncSession, system_task: Task) -> No
             credits = parent.credits_charged or 0
             remaining = parent.max_credits - credits
 
-            await release_to_worker(session, parent.id, parent.worker_id, credits)
+            await release_to_worker_with_fee(
+                session, parent.id, parent.worker_id, parent.poster_id,
+                credits, settings.platform_fee_percent,
+            )
             if remaining > 0:
                 await refund(session, parent.id, parent.poster_id, remaining)
 
@@ -220,6 +228,7 @@ async def create_task(
     need: str,
     max_credits: int = 50,
     tags: list[str] | None = None,
+    context: str | None = None,
 ) -> dict:
     """Create a task and escrow credits atomically in one transaction."""
     tid = make_task_id()
@@ -230,6 +239,7 @@ async def create_task(
         id=tid,
         poster_id=poster_id,
         need=need,
+        context=context,
         max_credits=max_credits,
         tags=tags_json,
         expires_at=expires_at,
@@ -263,6 +273,7 @@ async def get_task(session: AsyncSession, tid: str) -> dict | None:
         "poster_id": task.poster_id,
         "worker_id": task.worker_id,
         "need": task.need,
+        "context": task.context,
         "result": task.result,
         "status": task.status.value if isinstance(task.status, TaskStatus) else task.status,
         "max_credits": task.max_credits,
@@ -272,6 +283,24 @@ async def get_task(session: AsyncSession, tid: str) -> dict | None:
         "delivered_at": task.delivered_at.isoformat() if task.delivered_at else None,
         "expires_at": task.expires_at.isoformat() if task.expires_at else None,
     }
+
+
+def _check_abandon_cooldown(agent: Agent) -> None:
+    """Raise 429 if agent has too many recent abandons."""
+    if (
+        (agent.abandon_count or 0) >= settings.max_abandons_before_cooldown
+        and agent.last_abandon_at
+    ):
+        last = agent.last_abandon_at
+        # Ensure timezone-aware comparison (SQLite may strip tzinfo)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        cooldown_end = last + timedelta(minutes=settings.abandon_cooldown_minutes)
+        if datetime.now(UTC) < cooldown_end:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many abandons. Cooldown until {cooldown_end.isoformat()}",
+            )
 
 
 async def pickup_task(
@@ -287,6 +316,8 @@ async def pickup_task(
     agent = await session.get(Agent, worker_id)
     if not agent:
         return None
+
+    _check_abandon_cooldown(agent)
 
     # Phase 0: Infra agents try system tasks first
     if agent.accepts_system_tasks:
@@ -418,8 +449,51 @@ async def _try_claim(session: AsyncSession, task: Task, worker_id: str) -> dict 
         "task_id": task.id,
         "poster_id": task.poster_id,
         "need": task.need,
+        "context": task.context,
         "max_credits": task.max_credits,
     }
+
+
+async def pickup_specific_task(
+    session: AsyncSession, task_id: str, worker_id: str
+) -> dict | None:
+    """Claim a specific task by ID. Validates eligibility."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    if status != "posted":
+        raise HTTPException(status_code=409, detail=f"Task is {status}, not posted")
+
+    if task.poster_id == worker_id:
+        raise HTTPException(status_code=409, detail="Cannot pick up your own task")
+
+    if task.is_system:
+        raise HTTPException(status_code=409, detail="Cannot directly pick up system tasks")
+
+    # Conflict rule: check if this agent did system work on this task
+    conflict_result = await session.execute(
+        select(Task).where(
+            Task.is_system == True,  # noqa: E712
+            Task.worker_id == worker_id,
+            Task.parent_task_id == task_id,
+        )
+    )
+    if conflict_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409, detail="Conflict: you did system work on this task"
+        )
+
+    # Check abandon cooldown
+    agent = await session.get(Agent, worker_id)
+    if agent:
+        _check_abandon_cooldown(agent)
+
+    claimed = await _try_claim(session, task, worker_id)
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Task already claimed")
+    return claimed
 
 
 async def deliver_task(
@@ -464,6 +538,10 @@ async def deliver_task(
     # Bug #3 fix: do NOT increment tasks_completed here — only on approve
     await session.commit()
 
+    # SSE: notify poster that task was delivered
+    if not task.is_system:
+        event_bus.publish(task.poster_id, Event(type="task_delivered", task_id=tid))
+
     # Bug #7 fix: signal event so wait_for_result unblocks
     _get_event(tid).set()
 
@@ -473,13 +551,22 @@ async def deliver_task(
         "result": result,
         "credits_charged": actual_credits,
         "need": task.need,
+        "context": task.context,
         "poster_id": task.poster_id,
         "worker_id": task.worker_id,
     }
 
 
-async def approve_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
+async def approve_task(
+    session: AsyncSession,
+    tid: str,
+    poster_id: str,
+    rating: int | None = None,
+    feedback: str | None = None,
+) -> dict:
     """Approve delivery and release credits to worker."""
+    from pinchwork.services.agents import update_reputation
+
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -492,7 +579,9 @@ async def approve_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     credits = task.credits_charged or 0
     remaining = task.max_credits - credits
 
-    await release_to_worker(session, tid, task.worker_id, credits)
+    await release_to_worker_with_fee(
+        session, tid, task.worker_id, poster_id, credits, settings.platform_fee_percent,
+    )
     if remaining > 0:
         await refund(session, tid, poster_id, remaining)
 
@@ -505,19 +594,34 @@ async def approve_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
         {"id": task.worker_id},
     )
 
+    # Optional rating
+    if rating is not None:
+        r = Rating(task_id=tid, rater_id=poster_id, rated_id=task.worker_id, score=rating)
+        session.add(r)
+        await update_reputation(session, task.worker_id)
+
     await session.commit()
     _cleanup_event(tid)
 
-    return {
+    # SSE: notify worker that task was approved
+    event_bus.publish(task.worker_id, Event(type="task_approved", task_id=tid))
+
+    result_dict = {
         "id": task.id,
         "poster_id": task.poster_id,
         "worker_id": task.worker_id,
         "need": task.need,
+        "context": task.context,
         "result": task.result,
         "status": "approved",
         "max_credits": task.max_credits,
         "credits_charged": task.credits_charged,
     }
+    if rating is not None:
+        result_dict["rating"] = rating
+    if feedback is not None:
+        result_dict["feedback"] = feedback
+    return result_dict
 
 
 async def reject_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
@@ -531,6 +635,9 @@ async def reject_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
+    # Capture worker_id before clearing for SSE notification
+    rejected_worker_id = task.worker_id
+
     # Bug #2 fix: reset expires_at to fresh window
     task.status = TaskStatus.posted
     task.worker_id = None
@@ -542,11 +649,16 @@ async def reject_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     session.add(task)
     await session.commit()
 
+    # SSE: notify worker that task was rejected
+    if rejected_worker_id:
+        event_bus.publish(rejected_worker_id, Event(type="task_rejected", task_id=tid))
+
     return {
         "id": task.id,
         "poster_id": task.poster_id,
         "worker_id": None,
         "need": task.need,
+        "context": task.context,
         "result": None,
         "status": "posted",
         "max_credits": task.max_credits,
@@ -567,6 +679,12 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
+    # Collect matched agent IDs before commit for SSE notification
+    match_result = await session.execute(
+        select(TaskMatch.agent_id).where(TaskMatch.task_id == tid)
+    )
+    matched_agent_ids = [row[0] for row in match_result.fetchall()]
+
     task.status = TaskStatus.cancelled
     session.add(task)
 
@@ -574,15 +692,59 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     await session.commit()
     _cleanup_event(tid)
 
+    # SSE: notify matched agents that task was cancelled
+    event_bus.publish_many(
+        matched_agent_ids, Event(type="task_cancelled", task_id=tid)
+    )
+
     return {
         "id": task.id,
         "poster_id": task.poster_id,
         "worker_id": None,
         "need": task.need,
+        "context": task.context,
         "result": None,
         "status": "cancelled",
         "max_credits": task.max_credits,
         "credits_charged": None,
+    }
+
+
+async def abandon_task(session: AsyncSession, tid: str, worker_id: str) -> dict:
+    """Worker gives back a claimed task. Resets to posted with fresh expiry."""
+    task = await session.get(Task, tid)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    if status != "claimed":
+        raise HTTPException(status_code=409, detail=f"Task is {status}, not claimed")
+    if task.worker_id != worker_id:
+        raise HTTPException(status_code=403, detail="Not your task")
+
+    task.status = TaskStatus.posted
+    task.worker_id = None
+    task.claimed_at = None
+    task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
+    task.match_status = "broadcast"
+    session.add(task)
+
+    # Track abandon on the worker
+    worker = await session.get(Agent, worker_id)
+    if worker:
+        worker.abandon_count = (worker.abandon_count or 0) + 1
+        worker.last_abandon_at = datetime.now(UTC)
+        session.add(worker)
+
+    await session.commit()
+
+    return {
+        "id": task.id,
+        "poster_id": task.poster_id,
+        "worker_id": None,
+        "need": task.need,
+        "context": task.context,
+        "status": "posted",
+        "max_credits": task.max_credits,
     }
 
 
@@ -603,9 +765,160 @@ async def wait_for_result(session: AsyncSession, tid: str, timeout: int) -> dict
                 "poster_id": task.poster_id,
                 "worker_id": task.worker_id,
                 "need": task.need,
+                "context": task.context,
                 "result": task.result,
                 "status": status,
                 "max_credits": task.max_credits,
                 "credits_charged": task.credits_charged,
             }
     return await get_task(session, tid)
+
+
+async def list_available_tasks(
+    session: AsyncSession,
+    worker_id: str,
+    tags: list[str] | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    """List available tasks without claiming. Same priority as pickup."""
+    agent = await session.get(Agent, worker_id)
+    if not agent:
+        return {"tasks": [], "total": 0}
+
+    # Conflict rule: exclude tasks where this agent did system work
+    conflict_subquery = select(Task.parent_task_id).where(
+        Task.is_system == True,  # noqa: E712
+        Task.worker_id == worker_id,
+        Task.parent_task_id != None,  # noqa: E711
+    )
+
+    # Phase 1: Matched tasks
+    matched_subquery = select(TaskMatch.task_id).where(TaskMatch.agent_id == worker_id)
+    q_matched = select(Task).where(
+        Task.status == TaskStatus.posted,
+        Task.poster_id != worker_id,
+        Task.is_system == False,  # noqa: E712
+        Task.match_status == "matched",
+        Task.id.in_(matched_subquery),
+        Task.id.not_in(conflict_subquery),
+    )
+
+    # Phase 2: Broadcast + pending tasks
+    q_broadcast = select(Task).where(
+        Task.status == TaskStatus.posted,
+        Task.poster_id != worker_id,
+        Task.is_system == False,  # noqa: E712
+        Task.match_status.in_(["broadcast", "pending"]),
+        Task.id.not_in(conflict_subquery),
+    )
+
+    # Phase 3: Tasks with no match_status (backwards compat)
+    q_none = select(Task).where(
+        Task.status == TaskStatus.posted,
+        Task.poster_id != worker_id,
+        Task.is_system == False,  # noqa: E712
+        Task.match_status == None,  # noqa: E711
+        Task.id.not_in(conflict_subquery),
+    )
+
+    # Apply tag filters
+    for q_ref in [q_matched, q_broadcast, q_none]:
+        if tags:
+            for tag in tags:
+                q_ref = q_ref.where(Task.tags.contains(f'"{tag}"'))
+
+    # Gather all tasks in priority order
+    if tags:
+        # Rebuild with tags applied
+        q_matched_filtered = q_matched
+        q_broadcast_filtered = q_broadcast
+        q_none_filtered = q_none
+        for tag in tags:
+            q_matched_filtered = q_matched_filtered.where(Task.tags.contains(f'"{tag}"'))
+            q_broadcast_filtered = q_broadcast_filtered.where(Task.tags.contains(f'"{tag}"'))
+            q_none_filtered = q_none_filtered.where(Task.tags.contains(f'"{tag}"'))
+        r1 = await session.execute(q_matched_filtered)
+        r2 = await session.execute(q_broadcast_filtered.order_by(Task.created_at.asc()))
+        r3 = await session.execute(q_none_filtered.order_by(Task.created_at.asc()))
+    else:
+        r1 = await session.execute(q_matched)
+        r2 = await session.execute(q_broadcast.order_by(Task.created_at.asc()))
+        r3 = await session.execute(q_none.order_by(Task.created_at.asc()))
+
+    all_tasks = list(r1.scalars().all()) + list(r2.scalars().all()) + list(r3.scalars().all())
+    total = len(all_tasks)
+    page = all_tasks[offset : offset + limit]
+
+    def _task_to_dict(t: Task) -> dict:
+        tags_parsed = json.loads(t.tags) if t.tags else None
+        return {
+            "task_id": t.id,
+            "need": t.need,
+            "context": t.context,
+            "max_credits": t.max_credits,
+            "tags": tags_parsed,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "poster_id": t.poster_id,
+        }
+
+    return {"tasks": [_task_to_dict(t) for t in page], "total": total}
+
+
+async def create_report(
+    session: AsyncSession, task_id: str, reporter_id: str, reason: str
+) -> dict:
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    rid = make_report_id()
+    report = Report(id=rid, task_id=task_id, reporter_id=reporter_id, reason=reason)
+    session.add(report)
+    await session.commit()
+    return {"report_id": rid, "task_id": task_id, "reason": reason, "status": "open"}
+
+
+async def rate_poster(
+    session: AsyncSession,
+    task_id: str,
+    worker_id: str,
+    rating: int,
+    feedback: str | None = None,
+) -> dict:
+    """Worker rates the poster after task completion."""
+    from pinchwork.services.agents import update_reputation
+
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    if status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is {status}, not approved",
+        )
+    if task.worker_id != worker_id:
+        raise HTTPException(status_code=403, detail="Not your task")
+
+    # Prevent duplicate ratings
+    existing = await session.execute(
+        select(Rating).where(Rating.task_id == task_id, Rating.rater_id == worker_id)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Already rated")
+
+    r = Rating(
+        task_id=task_id,
+        rater_id=worker_id,
+        rated_id=task.poster_id,
+        score=rating,
+    )
+    session.add(r)
+    await update_reputation(session, task.poster_id)
+    await session.commit()
+
+    result = {"task_id": task_id, "rated_id": task.poster_id, "rating": rating}
+    if feedback:
+        result["feedback"] = feedback
+    return result

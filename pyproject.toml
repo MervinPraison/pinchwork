@@ -17,6 +17,7 @@ dependencies = [
     "sqlmodel>=0.0.22",
     "greenlet>=3.0.0",
     "bcrypt>=4.0.0",
+    "slowapi>=0.1.9",
 ]
 
 [project.optional-dependencies]

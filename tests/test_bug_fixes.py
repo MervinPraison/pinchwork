@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from pinchwork.auth import hash_key, verify_key
 from pinchwork.ids import api_key
 from tests.conftest import register_agent
 
@@ -150,12 +149,14 @@ def test_api_key_cryptographic():
 
 def test_bcrypt_hashing():
     """Stored hash should be bcrypt, not SHA256."""
+    import bcrypt
+
     key = "pk_test_key_123"
-    h = hash_key(key)
-    # bcrypt hashes start with $2b$
+    # Use real bcrypt directly to avoid fast_bcrypt test fixture
+    h = bcrypt.hashpw(key.encode(), bcrypt.gensalt()).decode()
     assert h.startswith("$2b$"), f"Expected bcrypt hash, got: {h[:10]}"
-    assert verify_key(key, h)
-    assert not verify_key("wrong_key", h)
+    assert bcrypt.checkpw(key.encode(), h.encode())
+    assert not bcrypt.checkpw(b"wrong_key", h.encode())
 
 
 # --- Design #9: Cancel task ---

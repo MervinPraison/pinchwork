@@ -34,3 +34,7 @@ def ledger_id() -> str:
 
 def match_id() -> str:
     return gen_id("mt_")
+
+
+def report_id() -> str:
+    return gen_id("rp_")

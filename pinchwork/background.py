@@ -13,7 +13,8 @@ from sqlmodel import select
 
 from pinchwork.config import settings
 from pinchwork.db_models import Task, TaskStatus
-from pinchwork.services.credits import refund, release_to_worker
+from pinchwork.events import Event, event_bus
+from pinchwork.services.credits import refund, release_to_worker, release_to_worker_with_fee
 
 logger = logging.getLogger("pinchwork.background")
 
@@ -35,10 +36,17 @@ async def expire_tasks(session: AsyncSession) -> int:
 
     if tasks:
         await session.commit()
+        for task in tasks:
+            event_bus.publish(
+                task.poster_id, Event(type="task_expired", task_id=task.id)
+            )
     return len(tasks)
 
 
 async def auto_approve_tasks(session: AsyncSession) -> int:
+    if settings.disable_auto_approve:
+        return 0
+
     result = await session.execute(
         text(
             "SELECT id FROM tasks WHERE status = 'delivered' "
@@ -54,7 +62,9 @@ async def auto_approve_tasks(session: AsyncSession) -> int:
         credits = task.credits_charged or 0
         remaining = task.max_credits - credits
 
-        await release_to_worker(session, tid, task.worker_id, credits)
+        await release_to_worker_with_fee(
+            session, tid, task.worker_id, task.poster_id, credits, settings.platform_fee_percent
+        )
         if remaining > 0:
             await refund(session, tid, task.poster_id, remaining)
 
@@ -70,6 +80,13 @@ async def auto_approve_tasks(session: AsyncSession) -> int:
 
     if task_ids:
         await session.commit()
+        # SSE: notify workers their tasks were auto-approved
+        for tid in task_ids:
+            task = await session.get(Task, tid)
+            if task and task.worker_id:
+                event_bus.publish(
+                    task.worker_id, Event(type="task_approved", task_id=tid)
+                )
     return len(task_ids)
 
 
