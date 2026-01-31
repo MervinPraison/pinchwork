@@ -23,7 +23,7 @@ def verify_key(key: str, key_hash: str) -> bool:
 
 
 def key_fingerprint(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()[:16]
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
 async def get_current_agent(
@@ -44,10 +44,7 @@ async def get_current_agent(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     if agent.suspended:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Agent suspended: {agent.suspend_reason or 'no reason given'}",
-        )
+        raise HTTPException(status_code=403, detail="Agent suspended")
 
     return agent
 

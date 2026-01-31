@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
+from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent, verify_admin_key
 from pinchwork.content import parse_body, render_response
 from pinchwork.database import get_db_session
 from pinchwork.db_models import Agent
-from pinchwork.models import AdminGrantRequest, CreditBalanceResponse, ErrorResponse
-from pinchwork.services.credits import get_escrowed_balance, get_ledger, grant_credits
+from pinchwork.models import (
+    AdminGrantRequest,
+    AgentStatsResponse,
+    CreditBalanceResponse,
+    ErrorResponse,
+)
+from pinchwork.services.credits import (
+    get_agent_stats,
+    get_escrowed_balance,
+    get_ledger,
+    grant_credits,
+)
 
 router = APIRouter()
 
@@ -34,6 +45,20 @@ async def my_credits(
     )
 
 
+@router.get(
+    "/v1/me/stats",
+    response_model=AgentStatsResponse,
+    responses={401: {"model": ErrorResponse}},
+)
+async def my_stats(
+    request: Request,
+    agent: Agent = AuthAgent,
+    session=Depends(get_db_session),
+):
+    stats = await get_agent_stats(session, agent.id)
+    return render_response(request, stats)
+
+
 @router.post("/v1/admin/credits/grant")
 async def admin_grant(
     request: Request,
@@ -43,7 +68,7 @@ async def admin_grant(
     body = await parse_body(request)
     try:
         req = AdminGrantRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
     await grant_credits(session, req.agent_id, req.amount, req.reason)

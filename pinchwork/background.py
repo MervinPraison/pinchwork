@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import select
 
 from pinchwork.config import settings
-from pinchwork.db_models import Task, TaskStatus
+from pinchwork.db_models import MatchStatus, SystemTaskType, Task, TaskMatch, TaskStatus
 from pinchwork.events import Event, event_bus
-from pinchwork.services.credits import refund, release_to_worker, release_to_worker_with_fee
+from pinchwork.services.credits import refund
+from pinchwork.services.tasks import (
+    cleanup_task_event,
+    finalize_system_task_approval,
+    finalize_task_approval,
+)
 
 logger = logging.getLogger("pinchwork.background")
 
@@ -37,9 +41,8 @@ async def expire_tasks(session: AsyncSession) -> int:
     if tasks:
         await session.commit()
         for task in tasks:
-            event_bus.publish(
-                task.poster_id, Event(type="task_expired", task_id=task.id)
-            )
+            cleanup_task_event(task.id)
+            event_bus.publish(task.poster_id, Event(type="task_expired", task_id=task.id))
     return len(tasks)
 
 
@@ -47,47 +50,32 @@ async def auto_approve_tasks(session: AsyncSession) -> int:
     if settings.disable_auto_approve:
         return 0
 
+    cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
     result = await session.execute(
-        text(
-            "SELECT id FROM tasks WHERE status = 'delivered' "
-            "AND delivered_at < datetime('now', '-24 hours')"
+        select(Task).where(
+            Task.status == TaskStatus.delivered,
+            Task.delivered_at < cutoff,
         )
     )
-    task_ids = [row[0] for row in result.fetchall()]
+    tasks = result.scalars().all()
 
-    for tid in task_ids:
-        task = await session.get(Task, tid)
-        if not task:
-            continue
-        credits = task.credits_charged or 0
-        remaining = task.max_credits - credits
-
-        await release_to_worker_with_fee(
-            session, tid, task.worker_id, task.poster_id, credits, settings.platform_fee_percent
+    for task in tasks:
+        await finalize_task_approval(session, task, settings.platform_fee_percent)
+        logger.info(
+            "Auto-approved task %s, paid %d to %s",
+            task.id,
+            task.credits_charged or 0,
+            task.worker_id,
         )
-        if remaining > 0:
-            await refund(session, tid, task.poster_id, remaining)
 
-        task.status = TaskStatus.approved
-        session.add(task)
-
-        # Bug #3 fix: increment tasks_completed on auto-approve
-        await session.execute(
-            text("UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE id = :id"),
-            {"id": task.worker_id},
-        )
-        logger.info("Auto-approved task %s, paid %d to %s", tid, credits, task.worker_id)
-
-    if task_ids:
+    if tasks:
         await session.commit()
         # SSE: notify workers their tasks were auto-approved
-        for tid in task_ids:
-            task = await session.get(Task, tid)
-            if task and task.worker_id:
-                event_bus.publish(
-                    task.worker_id, Event(type="task_approved", task_id=tid)
-                )
-    return len(task_ids)
+        for task in tasks:
+            cleanup_task_event(task.id)
+            if task.worker_id:
+                event_bus.publish(task.worker_id, Event(type="task_approved", task_id=task.id))
+    return len(tasks)
 
 
 async def expire_matching(session: AsyncSession) -> int:
@@ -95,7 +83,7 @@ async def expire_matching(session: AsyncSession) -> int:
     now = datetime.now(UTC).isoformat()
     result = await session.execute(
         select(Task).where(
-            Task.match_status == "pending",
+            Task.match_status == MatchStatus.pending,
             Task.match_deadline < now,
             Task.status == TaskStatus.posted,
         )
@@ -103,14 +91,14 @@ async def expire_matching(session: AsyncSession) -> int:
     tasks = result.scalars().all()
 
     for task in tasks:
-        task.match_status = "broadcast"
+        task.match_status = MatchStatus.broadcast
         session.add(task)
 
         # Cancel the associated system task if still posted
         sys_result = await session.execute(
             select(Task).where(
                 Task.is_system == True,  # noqa: E712
-                Task.system_task_type == "match_agents",
+                Task.system_task_type == SystemTaskType.match_agents,
                 Task.parent_task_id == task.id,
                 Task.status == TaskStatus.posted,
             )
@@ -127,37 +115,143 @@ async def expire_matching(session: AsyncSession) -> int:
     return len(tasks)
 
 
+async def expire_rejection_grace(session: AsyncSession) -> int:
+    """Reset tasks whose rejection grace period has expired back to posted."""
+    now = datetime.now(UTC).isoformat()
+    result = await session.execute(
+        select(Task).where(
+            Task.status == TaskStatus.claimed,
+            Task.rejection_grace_deadline != None,  # noqa: E711
+            Task.rejection_grace_deadline < now,
+        )
+    )
+    tasks = result.scalars().all()
+
+    for task in tasks:
+        expired_worker_id = task.worker_id
+        task.status = TaskStatus.posted
+        task.worker_id = None
+        task.claimed_at = None
+        task.rejection_grace_deadline = None
+        task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
+        task.match_status = MatchStatus.broadcast
+        session.add(task)
+
+        logger.info(
+            "Rejection grace expired for task %s, reset to posted",
+            task.id,
+        )
+
+        if expired_worker_id:
+            event_bus.publish(
+                expired_worker_id,
+                Event(type="rejection_grace_expired", task_id=task.id),
+            )
+
+    if tasks:
+        await session.commit()
+    return len(tasks)
+
+
 async def auto_approve_system_tasks(session: AsyncSession) -> int:
     """Auto-approve delivered system tasks after a short window."""
     cutoff_seconds = settings.system_task_auto_approve_seconds
+    cutoff = (datetime.now(UTC) - timedelta(seconds=cutoff_seconds)).isoformat()
     result = await session.execute(
-        text(
-            "SELECT id FROM tasks WHERE is_system = 1 AND status = 'delivered' "
-            f"AND delivered_at < datetime('now', '-{cutoff_seconds} seconds')"
+        select(Task).where(
+            Task.is_system == True,  # noqa: E712
+            Task.status == TaskStatus.delivered,
+            Task.delivered_at < cutoff,
         )
     )
-    task_ids = [row[0] for row in result.fetchall()]
+    tasks = result.scalars().all()
 
-    for tid in task_ids:
-        task = await session.get(Task, tid)
-        if not task:
-            continue
-        credits = task.credits_charged or 0
+    for task in tasks:
+        await finalize_system_task_approval(session, task)
+        logger.info(
+            "Auto-approved system task %s, paid %d to %s",
+            task.id,
+            task.credits_charged or 0,
+            task.worker_id,
+        )
 
-        if task.worker_id:
-            await release_to_worker(session, tid, task.worker_id, credits)
-            await session.execute(
-                text("UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE id = :id"),
-                {"id": task.worker_id},
+    if tasks:
+        await session.commit()
+    return len(tasks)
+
+
+async def expire_deadlines(session: AsyncSession) -> int:
+    """Handle tasks that have passed their deadline.
+
+    - Claimed tasks past deadline: reset to posted (worker ran out of time).
+    - Posted tasks past deadline: expire and refund.
+
+    We handle claimed and posted tasks separately with commits in between
+    to prevent a claimed→posted reset from immediately being expired.
+    """
+    now = datetime.now(UTC).isoformat()
+    count = 0
+
+    # Claimed tasks past deadline → reset to posted
+    result = await session.execute(
+        select(Task).where(
+            Task.status == TaskStatus.claimed,
+            Task.deadline != None,  # noqa: E711
+            Task.deadline < now,
+        )
+    )
+    claimed_tasks = result.scalars().all()
+
+    for task in claimed_tasks:
+        expired_worker_id = task.worker_id
+        task.status = TaskStatus.posted
+        task.worker_id = None
+        task.claimed_at = None
+        task.deadline = None  # Clear deadline after reset so it doesn't immediately expire
+        task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
+        task.match_status = MatchStatus.broadcast
+        session.add(task)
+        count += 1
+
+        logger.info("Deadline expired for claimed task %s, reset to posted", task.id)
+        if expired_worker_id:
+            event_bus.publish(
+                expired_worker_id,
+                Event(type="deadline_expired", task_id=task.id),
             )
 
-        task.status = TaskStatus.approved
-        session.add(task)
-        logger.info("Auto-approved system task %s, paid %d to %s", tid, credits, task.worker_id)
-
-    if task_ids:
+    if claimed_tasks:
         await session.commit()
-    return len(task_ids)
+
+    # Posted tasks past deadline → expire and refund
+    result2 = await session.execute(
+        select(Task).where(
+            Task.status == TaskStatus.posted,
+            Task.deadline != None,  # noqa: E711
+            Task.deadline < now,
+        )
+    )
+    posted_tasks = result2.scalars().all()
+
+    for task in posted_tasks:
+        # Collect matched agent IDs for notification
+        match_result = await session.execute(
+            select(TaskMatch.agent_id).where(TaskMatch.task_id == task.id)
+        )
+        matched_agent_ids = [row[0] for row in match_result.fetchall()]
+
+        task.status = TaskStatus.expired
+        session.add(task)
+        await refund(session, task.id, task.poster_id, task.max_credits)
+        count += 1
+
+        logger.info("Deadline expired for posted task %s, expired and refunded", task.id)
+        event_bus.publish(task.poster_id, Event(type="task_expired", task_id=task.id))
+        event_bus.publish_many(matched_agent_ids, Event(type="task_expired", task_id=task.id))
+
+    if posted_tasks:
+        await session.commit()
+    return count
 
 
 async def background_loop(session_factory: sessionmaker) -> None:
@@ -169,13 +263,21 @@ async def background_loop(session_factory: sessionmaker) -> None:
                 approved = await auto_approve_tasks(session)
                 match_expired = await expire_matching(session)
                 sys_approved = await auto_approve_system_tasks(session)
-                if expired or approved or match_expired or sys_approved:
+                grace_expired = await expire_rejection_grace(session)
+                deadline_expired = await expire_deadlines(session)
+                any_work = (
+                    expired or approved or match_expired
+                    or sys_approved or grace_expired or deadline_expired
+                )
+                if any_work:
                     logger.info(
-                        "Background: expired=%d, approved=%d, match_exp=%d, sys=%d",
+                        "BG: exp=%d, app=%d, mexp=%d, sys=%d, gexp=%d, dl=%d",
                         expired,
                         approved,
                         match_expired,
                         sys_approved,
+                        grace_expired,
+                        deadline_expired,
                     )
         except Exception:
             logger.exception("Background task error")

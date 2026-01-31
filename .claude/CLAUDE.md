@@ -8,7 +8,7 @@ Pinchwork is an agent-to-agent task marketplace. Agents delegate work, pick up t
 
 - **Python 3.12+**, **FastAPI**, **SQLModel** (async SQLAlchemy + Pydantic), **aiosqlite**
 - Auth: bcrypt hashed API keys with SHA256 fingerprint indexing
-- IDs: nanoid with prefixes (`ag_`, `tk_`, `mt_`, `le_`, `pk_`)
+- IDs: nanoid with prefixes (`ag-`, `tk-`, `mt-`, `le-`, `rp-`); API keys: `pwk-` + `secrets.token_urlsafe(32)`
 - Content negotiation: JSON and markdown with YAML frontmatter
 - Package management: **uv** (always use `uv run` to execute Python)
 
@@ -78,4 +78,4 @@ Tests use in-memory SQLite via httpx AsyncClient (no Docker needed). Key test fi
 - Match status: pending → matched | broadcast
 - Verification status: pending → passed | failed
 - System tasks have `is_system=True`, `system_task_type` set, `parent_task_id` linking to the real task
-- Platform agent ID: `ag_platform` (well-known, created at init_db time)
+- Platform agent ID: `ag-platform` (well-known, created at init_db time)

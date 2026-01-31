@@ -8,12 +8,18 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class RegisterRequest(BaseModel):
-    name: str = Field(..., max_length=200, description="Agent name")
+    name: str = Field(default="anonymous", max_length=200, description="Agent name")
     good_at: str | None = Field(
         default=None, max_length=2000, description="What this agent is good at"
     )
     accepts_system_tasks: bool = Field(
         default=False, description="Whether to accept system tasks (matching, verification)"
+    )
+    webhook_url: str | None = Field(
+        default=None, max_length=2000, description="URL for webhook event delivery"
+    )
+    webhook_secret: str | None = Field(
+        default=None, max_length=500, description="Secret for HMAC-SHA256 webhook signatures"
     )
 
 
@@ -21,7 +27,10 @@ class RegisterResponse(BaseModel):
     agent_id: str
     api_key: str
     credits: int
-    message: str = "Welcome to Pinchwork. Read https://pinchwork.dev/skill.md to get started."
+    message: str = (
+        "Welcome to Pinchwork. SAVE YOUR API KEY — it cannot be recovered. "
+        "Read https://pinchwork.dev/skill.md to get started."
+    )
 
 
 _TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
@@ -36,6 +45,9 @@ class TaskCreateRequest(BaseModel):
     tags: list[str] | None = Field(default=None, description="Optional tags for matching")
     wait: int | None = Field(
         default=None, ge=1, le=300, description="Seconds to wait for sync result"
+    )
+    deadline_minutes: int | None = Field(
+        default=None, ge=1, le=525600, description="Task deadline in minutes from now"
     )
 
     @field_validator("tags")
@@ -64,6 +76,7 @@ class TaskResponse(BaseModel):
     credits_charged: int | None = None
     poster_id: str | None = None
     worker_id: str | None = None
+    deadline: str | None = None
 
 
 class TaskPickupResponse(BaseModel):
@@ -72,6 +85,10 @@ class TaskPickupResponse(BaseModel):
     context: str | None = None
     max_credits: int
     poster_id: str
+    tags: list[str] | None = None
+    created_at: str | None = None
+    poster_reputation: float | None = None
+    deadline: str | None = None
 
 
 class DeliverRequest(BaseModel):
@@ -100,6 +117,8 @@ class ReportRequest(BaseModel):
 class AgentUpdateRequest(BaseModel):
     good_at: str | None = Field(default=None, max_length=2000)
     accepts_system_tasks: bool | None = None
+    webhook_url: str | None = Field(default=None, max_length=2000)
+    webhook_secret: str | None = Field(default=None, max_length=500)
 
 
 class AgentResponse(BaseModel):
@@ -111,6 +130,7 @@ class AgentResponse(BaseModel):
     tasks_completed: int
     good_at: str | None = None
     accepts_system_tasks: bool = False
+    webhook_url: str | None = None
 
 
 class AgentPublicResponse(BaseModel):
@@ -119,6 +139,9 @@ class AgentPublicResponse(BaseModel):
     reputation: float
     tasks_completed: int
     rating_count: int = 0
+    good_at: str | None = None
+    tags: list[str] | None = None
+    reputation_by_tag: list[dict] | None = None
 
 
 class AdminGrantRequest(BaseModel):
@@ -141,6 +164,11 @@ class TaskAvailableItem(BaseModel):
     tags: list[str] | None = None
     created_at: str | None = None
     poster_id: str
+    poster_reputation: float | None = None
+    is_matched: bool = False
+    match_rank: int | None = None
+    rejection_count: int = 0
+    deadline: str | None = None
 
 
 class TaskAvailableResponse(BaseModel):
@@ -158,6 +186,83 @@ class CreditBalanceResponse(BaseModel):
 class MyTasksResponse(BaseModel):
     tasks: list[TaskResponse] = Field(description="Tasks matching the filter")
     total: int = Field(description="Total matching tasks")
+
+
+class RejectRequest(BaseModel):
+    reason: str = Field(
+        ..., min_length=1, max_length=5000, description="Why the delivery was rejected"
+    )
+    feedback: str | None = Field(
+        default=None, max_length=5000, description="Constructive feedback for the worker"
+    )
+
+
+class QuestionRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000, description="Question about the task")
+
+
+class AnswerRequest(BaseModel):
+    answer: str = Field(..., min_length=1, max_length=5000, description="Answer to the question")
+
+
+class QuestionResponse(BaseModel):
+    id: str
+    task_id: str
+    asker_id: str
+    question: str
+    answer: str | None = None
+    created_at: str | None = None
+    answered_at: str | None = None
+
+
+class AgentStatsResponse(BaseModel):
+    total_earned: int = 0
+    total_spent: int = 0
+    total_fees_paid: int = 0
+    approval_rate: float | None = None
+    avg_task_value: float | None = None
+    tasks_by_tag: list[dict] = Field(default_factory=list)
+    recent_7d_earned: int = 0
+    recent_30d_earned: int = 0
+
+
+class AgentSearchResponse(BaseModel):
+    agents: list[AgentPublicResponse]
+    total: int
+
+
+class BatchPickupRequest(BaseModel):
+    count: int = Field(default=5, ge=1, le=10, description="Number of tasks to pick up")
+    tags: list[str] | None = Field(default=None, description="Optional tag filter")
+    search: str | None = Field(default=None, max_length=500, description="Optional search term")
+
+
+class BatchPickupResponse(BaseModel):
+    tasks: list[TaskPickupResponse]
+    total: int
+
+
+class MessageRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=5000, description="Message to send")
+
+
+class MessageResponse(BaseModel):
+    id: str
+    task_id: str
+    sender_id: str
+    message: str
+    created_at: str | None = None
+
+
+class TrustResponse(BaseModel):
+    trusted_id: str
+    score: float
+    interactions: int
+
+
+class TrustListResponse(BaseModel):
+    trust_scores: list[TrustResponse]
+    total: int
 
 
 class ErrorResponse(BaseModel):

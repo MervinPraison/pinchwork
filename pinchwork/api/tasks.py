@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request, Response
+from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent
 from pinchwork.config import settings
@@ -10,9 +11,14 @@ from pinchwork.content import parse_body, render_response, render_task_result
 from pinchwork.database import get_db_session
 from pinchwork.db_models import Agent
 from pinchwork.models import (
+    AnswerRequest,
+    BatchPickupRequest,
     ErrorResponse,
+    MessageRequest,
     MyTasksResponse,
+    QuestionRequest,
     RateRequest,
+    RejectRequest,
     ReportRequest,
     TaskAvailableResponse,
     TaskCreateRequest,
@@ -22,18 +28,24 @@ from pinchwork.models import (
 from pinchwork.rate_limit import limiter
 from pinchwork.services.tasks import (
     abandon_task,
+    answer_question,
     approve_task,
+    ask_question,
     cancel_task,
     create_report,
     create_task,
     deliver_task,
     get_task,
     list_available_tasks,
+    list_messages,
     list_my_tasks,
+    list_questions,
+    pickup_batch,
     pickup_specific_task,
     pickup_task,
     rate_poster,
     reject_task,
+    send_message,
     wait_for_result,
 )
 
@@ -54,7 +66,7 @@ async def delegate_task(
     # Bug #16: validate through Pydantic model
     try:
         validated = TaskCreateRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
     if not validated.need:
@@ -67,6 +79,7 @@ async def delegate_task(
         validated.max_credits,
         tags=validated.tags,
         context=validated.context,
+        deadline_minutes=validated.deadline_minutes,
     )
 
     if validated.wait:
@@ -92,12 +105,13 @@ async def browse_tasks(
     agent: Agent = AuthAgent,
     session=Depends(get_db_session),
     tags: str | None = None,
+    search: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ):
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
     result = await list_available_tasks(
-        session, agent.id, tags=tag_list, limit=limit, offset=offset
+        session, agent.id, tags=tag_list, search=search, limit=limit, offset=offset
     )
     return render_response(request, result)
 
@@ -137,8 +151,9 @@ async def poll_task(
     if not task:
         return render_response(request, {"error": "Task not found"}, status_code=404)
 
+    # Return 404 for both "not found" and "not authorized" to prevent task ID enumeration
     if task["poster_id"] != agent.id and task.get("worker_id") != agent.id:
-        return render_response(request, {"error": "Not authorized"}, status_code=403)
+        return render_response(request, {"error": "Task not found"}, status_code=404)
 
     return render_task_result(request, task)
 
@@ -154,9 +169,10 @@ async def pickup(
     agent: Agent = AuthAgent,
     session=Depends(get_db_session),
     tags: str | None = None,
+    search: str | None = None,
 ):
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
-    task = await pickup_task(session, agent.id, tags=tag_list)
+    task = await pickup_task(session, agent.id, tags=tag_list, search=search)
     if not task:
         # Bug #5 fix: 204 with no body
         return Response(status_code=204)
@@ -223,9 +239,7 @@ async def approve(
         try:
             rating = int(rating)
         except (ValueError, TypeError):
-            return render_response(
-                request, {"error": "rating must be an integer"}, status_code=400
-            )
+            return render_response(request, {"error": "rating must be an integer"}, status_code=400)
     task = await approve_task(session, task_id, agent.id, rating=rating, feedback=feedback)
     return render_task_result(request, task)
 
@@ -234,6 +248,7 @@ async def approve(
     "/v1/tasks/{task_id}/reject",
     response_model=TaskResponse,
     responses={
+        400: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         409: {"model": ErrorResponse},
@@ -242,7 +257,14 @@ async def approve(
 async def reject(
     request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
 ):
-    task = await reject_task(session, task_id, agent.id)
+    body = await parse_body(request)
+    try:
+        req = RejectRequest(**body)
+    except (ValidationError, Exception):
+        return render_response(
+            request, {"error": "Missing required field: reason"}, status_code=400
+        )
+    task = await reject_task(session, task_id, agent.id, reason=req.reason, feedback=req.feedback)
     return render_task_result(request, task)
 
 
@@ -316,7 +338,7 @@ async def rate_task_poster(
     body = await parse_body(request)
     try:
         req = RateRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
     result = await rate_poster(session, task_id, agent.id, req.rating, req.feedback)
     return render_response(request, result, status_code=201)
@@ -335,7 +357,139 @@ async def report_task(
     body = await parse_body(request)
     try:
         req = ReportRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Missing reason"}, status_code=400)
     result = await create_report(session, task_id, agent.id, req.reason)
     return render_response(request, result, status_code=201)
+
+
+# ---------------------------------------------------------------------------
+# Task Questions
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/v1/tasks/{task_id}/questions",
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+)
+async def post_question(
+    request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    body = await parse_body(request)
+    try:
+        req = QuestionRequest(**body)
+    except (ValidationError, Exception):
+        return render_response(
+            request, {"error": "Missing required field: question"}, status_code=400
+        )
+    result = await ask_question(session, task_id, agent.id, req.question)
+    return render_response(request, result, status_code=201)
+
+
+@router.post(
+    "/v1/tasks/{task_id}/questions/{question_id}/answer",
+    responses={
+        400: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def post_answer(
+    request: Request,
+    task_id: str,
+    question_id: str,
+    agent: Agent = AuthAgent,
+    session=Depends(get_db_session),
+):
+    body = await parse_body(request)
+    try:
+        req = AnswerRequest(**body)
+    except (ValidationError, Exception):
+        return render_response(
+            request, {"error": "Missing required field: answer"}, status_code=400
+        )
+    result = await answer_question(session, task_id, question_id, agent.id, req.answer)
+    return render_response(request, result)
+
+
+@router.get(
+    "/v1/tasks/{task_id}/questions",
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_questions(
+    request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    questions = await list_questions(session, task_id)
+    return render_response(request, {"questions": questions, "total": len(questions)})
+
+
+# ---------------------------------------------------------------------------
+# Mid-Task Messaging
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/v1/tasks/{task_id}/messages",
+    responses={
+        400: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+async def post_message(
+    request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    body = await parse_body(request)
+    try:
+        req = MessageRequest(**body)
+    except (ValidationError, Exception):
+        return render_response(
+            request, {"error": "Missing required field: message"}, status_code=400
+        )
+    result = await send_message(session, task_id, agent.id, req.message)
+    return render_response(request, result, status_code=201)
+
+
+@router.get(
+    "/v1/tasks/{task_id}/messages",
+    responses={
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+    },
+)
+async def get_messages(
+    request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    messages = await list_messages(session, task_id, agent.id)
+    return render_response(request, {"messages": messages, "total": len(messages)})
+
+
+# ---------------------------------------------------------------------------
+# Batch Pickup
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/v1/tasks/pickup/batch",
+    responses={401: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
+)
+@limiter.limit(settings.rate_limit_pickup)
+async def batch_pickup(
+    request: Request,
+    agent: Agent = AuthAgent,
+    session=Depends(get_db_session),
+):
+    body = await parse_body(request)
+    try:
+        req = BatchPickupRequest(**body)
+    except (ValidationError, Exception):
+        return render_response(request, {"error": "Invalid request body"}, status_code=400)
+    tasks = await pickup_batch(session, agent.id, count=req.count, tags=req.tags, search=req.search)
+    return render_response(request, {"tasks": tasks, "total": len(tasks)})

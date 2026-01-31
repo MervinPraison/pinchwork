@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,12 +19,21 @@ class Event:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+# Type for webhook callback: (agent_id, event) -> awaitable
+WebhookCallback = Callable[[str, Event], Awaitable[None]]
+
+
 class EventBus:
     """In-memory pub/sub for agent-scoped events."""
 
     def __init__(self, max_queue_size: int = 100):
         self._subscribers: dict[str, list[asyncio.Queue[Event | None]]] = {}
         self._max_queue_size = max_queue_size
+        self._webhook_callback: WebhookCallback | None = None
+
+    def set_webhook_callback(self, callback: WebhookCallback) -> None:
+        """Register a webhook delivery callback."""
+        self._webhook_callback = callback
 
     def subscribe(self, agent_id: str) -> asyncio.Queue[Event | None]:
         q: asyncio.Queue[Event | None] = asyncio.Queue(maxsize=self._max_queue_size)
@@ -42,6 +53,10 @@ class EventBus:
                 q.put_nowait(event)
             except asyncio.QueueFull:
                 logger.warning("Event queue full for agent %s, dropping event", agent_id)
+
+        if self._webhook_callback:
+            with contextlib.suppress(RuntimeError):
+                asyncio.create_task(self._webhook_callback(agent_id, event))
 
     def publish_many(self, agent_ids: list[str], event: Event) -> None:
         for aid in agent_ids:

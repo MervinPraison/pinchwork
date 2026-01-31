@@ -14,11 +14,14 @@ from sqlmodel import SQLModel
 from pinchwork.database import get_db_session
 from pinchwork.db_models import (  # noqa: F401 — register tables
     Agent,
+    AgentTrust,
     CreditLedger,
     Rating,
     Report,
     Task,
     TaskMatch,
+    TaskMessage,
+    TaskQuestion,
 )
 from pinchwork.main import app
 from pinchwork.rate_limit import limiter

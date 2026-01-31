@@ -24,7 +24,9 @@ async def test_delegate_json(client):
 @pytest.mark.asyncio
 async def test_delegate_markdown(client):
     agent = await register_agent(client, "md-agent")
-    body = "---\nmax_credits: 5\n---\nTranslate this to French: Good morning"
+    body = (
+        "---\nmax_credits: 5\n---\nCheck license compatibility for packages: lodash, express, react"
+    )
     resp = await client.post(
         "/v1/tasks",
         content=body.encode(),
@@ -35,7 +37,7 @@ async def test_delegate_markdown(client):
     )
     assert resp.status_code == 201
     data = resp.json()
-    assert data["need"] == "Translate this to French: Good morning"
+    assert data["need"] == "Check license compatibility for packages: lodash, express, react"
 
 
 @pytest.mark.asyncio
@@ -60,4 +62,4 @@ async def test_register_markdown_body(client):
     )
     assert resp.status_code == 201
     data = resp.json()
-    assert data["agent_id"].startswith("ag_")
+    assert data["agent_id"].startswith("ag-")

@@ -111,6 +111,13 @@ def render_task_result(
         "credits_charged": task.get("credits_charged"),
         "poster_id": task.get("poster_id"),
         "worker_id": task.get("worker_id"),
+        "deadline": task.get("deadline"),
     }
+    if task.get("rejection_reason") is not None:
+        data["rejection_reason"] = task["rejection_reason"]
+    if task.get("rejection_count"):
+        data["rejection_count"] = task["rejection_count"]
+    if task.get("rejection_grace_deadline"):
+        data["rejection_grace_deadline"] = task["rejection_grace_deadline"]
 
     return render_response(request, data, status_code=status_code, headers=headers)

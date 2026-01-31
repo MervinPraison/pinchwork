@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
+from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent, verify_admin_key
 from pinchwork.config import settings
@@ -13,12 +14,22 @@ from pinchwork.models import (
     AdminSuspendRequest,
     AgentPublicResponse,
     AgentResponse,
+    AgentSearchResponse,
     AgentUpdateRequest,
     ErrorResponse,
+    RegisterRequest,
     RegisterResponse,
 )
 from pinchwork.rate_limit import limiter
-from pinchwork.services.agents import get_agent, register, suspend_agent, update_agent
+from pinchwork.services.agents import (
+    get_agent,
+    get_reputation_breakdown,
+    register,
+    search_agents,
+    suspend_agent,
+    update_agent,
+)
+from pinchwork.services.trust import get_trust_scores
 
 router = APIRouter()
 
@@ -27,15 +38,18 @@ router = APIRouter()
 @limiter.limit(settings.rate_limit_register)
 async def register_agent(request: Request, session=Depends(get_db_session)):
     body = await parse_body(request)
-    name = body.get("name", "anonymous")
-    good_at = body.get("good_at")
-    accepts_system_tasks = body.get("accepts_system_tasks", False)
+    try:
+        req = RegisterRequest(**body)
+    except ValidationError:
+        return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
     result = await register(
         session,
-        name,
-        good_at=good_at,
-        accepts_system_tasks=accepts_system_tasks,
+        req.name,
+        good_at=req.good_at,
+        accepts_system_tasks=req.accepts_system_tasks,
+        webhook_url=req.webhook_url,
+        webhook_secret=req.webhook_secret,
     )
 
     return render_response(
@@ -66,6 +80,7 @@ async def get_me(request: Request, agent: Agent = AuthAgent):
             tasks_completed=agent.tasks_completed,
             good_at=agent.good_at,
             accepts_system_tasks=agent.accepts_system_tasks,
+            webhook_url=agent.webhook_url,
         ),
     )
 
@@ -79,7 +94,7 @@ async def update_me(request: Request, agent: Agent = AuthAgent, session=Depends(
     body = await parse_body(request)
     try:
         update = AgentUpdateRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
     result = await update_agent(
@@ -87,6 +102,8 @@ async def update_me(request: Request, agent: Agent = AuthAgent, session=Depends(
         agent.id,
         good_at=update.good_at,
         accepts_system_tasks=update.accepts_system_tasks,
+        webhook_url=update.webhook_url,
+        webhook_secret=update.webhook_secret,
     )
     if not result:
         return render_response(request, {"error": "Agent not found"}, status_code=404)
@@ -102,8 +119,36 @@ async def update_me(request: Request, agent: Agent = AuthAgent, session=Depends(
             tasks_completed=result["tasks_completed"],
             good_at=result["good_at"],
             accepts_system_tasks=result["accepts_system_tasks"],
+            webhook_url=result.get("webhook_url"),
         ),
     )
+
+
+@router.get(
+    "/v1/agents",
+    response_model=AgentSearchResponse,
+)
+async def list_agents(
+    request: Request,
+    session=Depends(get_db_session),
+    tags: str | None = None,
+    search: str | None = None,
+    min_reputation: float | None = None,
+    sort_by: str = "reputation",
+    limit: int = 20,
+    offset: int = 0,
+):
+    tag_list = [t.strip() for t in tags.split(",")] if tags else None
+    result = await search_agents(
+        session,
+        tags=tag_list,
+        search=search,
+        min_reputation=min_reputation,
+        sort_by=sort_by,
+        limit=limit,
+        offset=offset,
+    )
+    return render_response(request, result)
 
 
 @router.get(
@@ -116,6 +161,8 @@ async def get_agent_profile(request: Request, agent_id: str, session=Depends(get
     if not agent:
         return render_response(request, {"error": "Agent not found"}, status_code=404)
 
+    breakdown = await get_reputation_breakdown(session, agent_id)
+
     return render_response(
         request,
         AgentPublicResponse(
@@ -124,8 +171,19 @@ async def get_agent_profile(request: Request, agent_id: str, session=Depends(get
             reputation=agent["reputation"],
             tasks_completed=agent["tasks_completed"],
             rating_count=agent.get("rating_count", 0),
+            good_at=agent.get("good_at"),
+            tags=agent.get("capability_tags"),
+            reputation_by_tag=breakdown if breakdown else None,
         ),
     )
+
+
+@router.get("/v1/me/trust")
+async def get_my_trust(
+    request: Request, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    scores = await get_trust_scores(session, agent.id)
+    return render_response(request, {"trust_scores": scores, "total": len(scores)})
 
 
 @router.post("/v1/admin/agents/suspend")
@@ -137,7 +195,7 @@ async def admin_suspend(
     body = await parse_body(request)
     try:
         req = AdminSuspendRequest(**body)
-    except Exception:
+    except ValidationError:
         return render_response(request, {"error": "Invalid request body"}, status_code=400)
 
     result = await suspend_agent(session, req.agent_id, req.suspended, req.reason)

@@ -23,7 +23,10 @@ async def test_full_cycle_json(two_agents):
     resp = await c.post(
         "/v1/tasks",
         headers=jhdr(poster["key"]),
-        json={"need": "Translate 'hello' to Dutch", "max_credits": 10},
+        json={
+            "need": "Send an SMS to +31612345678: Your deployment succeeded at 14:32 UTC",
+            "max_credits": 10,
+        },
     )
     assert resp.status_code == 201
     data = resp.json()
@@ -44,7 +47,12 @@ async def test_full_cycle_json(two_agents):
     resp = await c.post(
         f"/v1/tasks/{task_id}/deliver",
         headers=jhdr(worker["key"]),
-        json={"result": "Hallo"},
+        json={
+            "result": (
+                "SMS sent. SID: SM1234567890abcdef,"
+                " status: delivered, timestamp: 2025-01-15T14:32:05Z"
+            ),
+        },
     )
     assert resp.status_code == 200
     delivered = resp.json()
@@ -72,7 +80,10 @@ async def test_full_cycle_markdown(two_agents):
     worker = two_agents["worker"]
 
     # Delegate with markdown
-    md_body = "---\nmax_credits: 5\n---\nTranslate 'goodbye' to Dutch"
+    md_body = (
+        "---\nmax_credits: 5\n---\n"
+        "Review this SaaS ToS for red flags: liability caps, notice periods, dispute resolution"
+    )
     resp = await c.post(
         "/v1/tasks",
         headers={**hdr(poster["key"])},
@@ -91,7 +102,10 @@ async def test_full_cycle_markdown(two_agents):
     resp = await c.post(
         f"/v1/tasks/{task_id}/deliver",
         headers=hdr(worker["key"]),
-        content=b"Tot ziens",
+        content=(
+            b"No red flags found. Liability cap is 12 months fees (standard)."
+            b" 30-day pricing change notice. Arbitration in NL."
+        ),
     )
     assert resp.status_code == 200
 
@@ -119,9 +133,13 @@ async def test_reject_resets_to_posted(two_agents):
     )
 
     # Reject
-    resp = await c.post(f"/v1/tasks/{task_id}/reject", headers=hdr(poster["key"]))
+    resp = await c.post(
+        f"/v1/tasks/{task_id}/reject",
+        json={"reason": "Not good enough"},
+        headers=hdr(poster["key"]),
+    )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "posted"  # Reset for re-claim
+    assert resp.json()["status"] == "claimed"  # Worker keeps claim during grace period
 
 
 @pytest.mark.asyncio
@@ -207,9 +225,9 @@ async def test_task_visibility(two_agents):
     )
     task_id = resp.json()["task_id"]
 
-    # Outsider can't see it
+    # Outsider can't see it (returns 404 to prevent task ID enumeration)
     resp = await c.get(f"/v1/tasks/{task_id}", headers=hdr(outsider_key))
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +245,11 @@ async def test_create_task_with_context(two_agents):
         "/v1/tasks",
         headers=jhdr(poster["key"]),
         json={
-            "need": "Translate to Dutch",
-            "context": "This is for a legal document",
+            "need": "Review this endpoint for security vulnerabilities",
+            "context": (
+                "FastAPI app, Python 3.12. Endpoint handles user settings updates."
+                " Focus on injection and auth bypass."
+            ),
             "max_credits": 10,
         },
     )
@@ -238,7 +259,11 @@ async def test_create_task_with_context(two_agents):
     resp = await c.post("/v1/tasks/pickup", headers=hdr(worker["key"]))
     assert resp.status_code == 200
     data = resp.json()
-    assert data["context"] == "This is for a legal document"
+    expected_ctx = (
+        "FastAPI app, Python 3.12. Endpoint handles user settings updates."
+        " Focus on injection and auth bypass."
+    )
+    assert data["context"] == expected_ctx
 
 
 @pytest.mark.asyncio
@@ -388,18 +413,26 @@ async def test_browse_tag_filtering(two_agents):
     await c.post(
         "/v1/tasks",
         headers=jhdr(poster["key"]),
-        json={"need": "Dutch task", "max_credits": 5, "tags": ["dutch"]},
+        json={
+            "need": "Review API endpoint for OWASP Top 10 vulnerabilities",
+            "max_credits": 5,
+            "tags": ["security-audit"],
+        },
     )
     await c.post(
         "/v1/tasks",
         headers=jhdr(poster["key"]),
-        json={"need": "French task", "max_credits": 5, "tags": ["french"]},
+        json={
+            "need": "Send SMS delivery confirmation to +31612345678",
+            "max_credits": 5,
+            "tags": ["sms-delivery"],
+        },
     )
 
-    resp = await c.get("/v1/tasks/available?tags=dutch", headers=hdr(worker["key"]))
+    resp = await c.get("/v1/tasks/available?tags=security-audit", headers=hdr(worker["key"]))
     data = resp.json()
     assert data["total"] == 1
-    assert data["tasks"][0]["need"] == "Dutch task"
+    assert data["tasks"][0]["need"] == "Review API endpoint for OWASP Top 10 vulnerabilities"
 
 
 @pytest.mark.asyncio

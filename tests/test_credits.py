@@ -46,7 +46,11 @@ async def test_escrow_and_refund_on_reject(client):
     )
 
     # Poster rejects — task goes back to posted, no credit movement yet
-    await client.post(f"/v1/tasks/{task_id}/reject", headers=auth_header(poster["api_key"]))
+    await client.post(
+        f"/v1/tasks/{task_id}/reject",
+        json={"reason": "Rejected"},
+        headers=auth_header(poster["api_key"]),
+    )
 
     # Poster still has 90 (escrow still held)
     resp = await client.get("/v1/me", headers=auth_header(poster["api_key"]))

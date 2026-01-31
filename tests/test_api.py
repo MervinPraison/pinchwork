@@ -15,7 +15,7 @@ async def test_register(client):
     assert resp.status_code == 201
     data = resp.json()
     assert "agent_id" in data
-    assert data["api_key"].startswith("pk_")
+    assert data["api_key"].startswith("pwk-")
     assert data["credits"] == 100
 
 

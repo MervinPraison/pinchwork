@@ -14,12 +14,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from pinchwork.config import settings
-from pinchwork.db_models import Agent, Rating, Report, Task, TaskMatch, TaskStatus
+from pinchwork.db_models import (
+    Agent,
+    AgentTrust,
+    MatchStatus,
+    Rating,
+    Report,
+    SystemTaskType,
+    Task,
+    TaskMatch,
+    TaskMessage,
+    TaskQuestion,
+    TaskStatus,
+    VerificationStatus,
+)
 from pinchwork.events import Event, event_bus
 from pinchwork.ids import match_id as make_match_id
+from pinchwork.ids import message_id as make_message_id
+from pinchwork.ids import question_id as make_question_id
 from pinchwork.ids import report_id as make_report_id
 from pinchwork.ids import task_id as make_task_id
-from pinchwork.services.credits import escrow, refund, release_to_worker, release_to_worker_with_fee
+from pinchwork.services.credits import (
+    escrow,
+    increment_tasks_completed,
+    increment_tasks_posted,
+    refund,
+    release_to_worker,
+    release_to_worker_with_fee,
+)
+from pinchwork.utils import safe_json_loads, status_str
 
 logger = logging.getLogger("pinchwork.tasks")
 
@@ -33,7 +56,7 @@ def _get_event(tid: str) -> asyncio.Event:
     return _task_events[tid]
 
 
-def _cleanup_event(tid: str) -> None:
+def cleanup_task_event(tid: str) -> None:
     _task_events.pop(tid, None)
 
 
@@ -42,17 +65,87 @@ def _cleanup_event(tid: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _maybe_spawn_matching(session: AsyncSession, task: Task) -> None:
-    """Create a match_agents system task if any infra agents exist."""
+async def _get_infra_agents(session: AsyncSession) -> list[Agent]:
+    """Return agents that accept system tasks (excluding platform agent)."""
     result = await session.execute(
         select(Agent).where(
             Agent.accepts_system_tasks.is_(True), Agent.id != settings.platform_agent_id
         )
     )
-    infra_agents = result.scalars().all()
-    if not infra_agents:
-        task.match_status = "broadcast"
+    return list(result.scalars().all())
+
+
+async def _builtin_match(session: AsyncSession, task: Task) -> None:
+    """Built-in tag-overlap matcher when no infra agents exist."""
+    result = await session.execute(
+        select(Agent).where(
+            Agent.id != settings.platform_agent_id,
+            Agent.id != task.poster_id,
+            Agent.suspended.is_(False),
+            Agent.good_at != None,  # noqa: E711
+        )
+    )
+    candidates = list(result.scalars().all())
+    if not candidates:
+        task.match_status = MatchStatus.broadcast
         session.add(task)
+        return
+
+    # Parse task tags
+    task_tags: set[str] = set()
+    for field in (task.tags, task.extracted_tags):
+        parsed = safe_json_loads(field)
+        if parsed:
+            task_tags.update(t.lower() for t in parsed)
+
+    task_keywords = set(task.need.lower().split()) if task.need else set()
+
+    scored: list[tuple[Agent, float]] = []
+    for agent in candidates:
+        agent_tags: set[str] = set()
+        cap_tags = safe_json_loads(agent.capability_tags)
+        if cap_tags:
+            agent_tags.update(t.lower() for t in cap_tags)
+
+        # Also parse good_at as keywords
+        agent_keywords = set(agent.good_at.lower().split()) if agent.good_at else set()
+
+        tag_overlap = len(task_tags & agent_tags) * 2
+        keyword_overlap = len(task_keywords & agent_keywords)
+        # F4: reputation factor
+        rep_bonus = agent.reputation * 0.5
+        score = tag_overlap + keyword_overlap + rep_bonus
+
+        if score > 0:
+            scored.append((agent, score))
+
+    if not scored:
+        task.match_status = MatchStatus.broadcast
+        session.add(task)
+        return
+
+    # Sort by score descending, take top 5
+    scored.sort(key=lambda x: -x[1])
+    top = scored[:5]
+
+    for rank, (agent, _score) in enumerate(top):
+        tm = TaskMatch(
+            id=make_match_id(),
+            task_id=task.id,
+            agent_id=agent.id,
+            rank=rank,
+        )
+        session.add(tm)
+
+    task.match_status = MatchStatus.matched
+    session.add(task)
+
+
+async def _maybe_spawn_matching(session: AsyncSession, task: Task) -> None:
+    """Create a match_agents system task if any infra agents exist."""
+    infra_agents = await _get_infra_agents(session)
+    if not infra_agents:
+        await _builtin_match(session, task)
         return
 
     # Build agent list for the matching prompt
@@ -63,10 +156,14 @@ async def _maybe_spawn_matching(session: AsyncSession, task: Task) -> None:
     agent_list = [{"id": a.id, "good_at": a.good_at} for a in agents_with_skills]
 
     context_line = f"\nContext: {task.context}\n" if task.context else ""
+    tags_line = f"\nTags: {task.tags}\n" if task.tags else ""
     need = (
-        f"Match agents for: {task.need}\n{context_line}\n"
+        f"Match agents for: {task.need}\n{context_line}{tags_line}\n"
         f"Available agents:\n{json.dumps(agent_list)}\n\n"
-        'Return JSON: {"ranked_agents": ["agent_id_1", "agent_id_2", ...]}'
+        'Return JSON: {"ranked_agents": ["agent_id_1", "agent_id_2", ...], '
+        '"extracted_tags": ["tag1", "tag2", ...]}\n'
+        "extracted_tags: short lowercase keywords describing "
+        "the task domain/skills needed (max 20)."
     )
 
     system_tid = make_task_id()
@@ -76,25 +173,20 @@ async def _maybe_spawn_matching(session: AsyncSession, task: Task) -> None:
         need=need,
         max_credits=settings.match_credits,
         is_system=True,
-        system_task_type="match_agents",
+        system_task_type=SystemTaskType.match_agents,
         parent_task_id=task.id,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.task_expire_hours),
     )
     session.add(system_task)
 
-    task.match_status = "pending"
+    task.match_status = MatchStatus.pending
     task.match_deadline = datetime.now(UTC) + timedelta(seconds=settings.match_timeout_seconds)
     session.add(task)
 
 
 async def _maybe_spawn_verification(session: AsyncSession, task: Task) -> None:
     """Create a verify_completion system task if any infra agents exist."""
-    result = await session.execute(
-        select(Agent).where(
-            Agent.accepts_system_tasks.is_(True), Agent.id != settings.platform_agent_id
-        )
-    )
-    infra_agents = result.scalars().all()
+    infra_agents = await _get_infra_agents(session)
     if not infra_agents:
         return
 
@@ -113,13 +205,13 @@ async def _maybe_spawn_verification(session: AsyncSession, task: Task) -> None:
         need=need,
         max_credits=settings.verify_credits,
         is_system=True,
-        system_task_type="verify_completion",
+        system_task_type=SystemTaskType.verify_completion,
         parent_task_id=task.id,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.task_expire_hours),
     )
     session.add(system_task)
 
-    task.verification_status = "pending"
+    task.verification_status = VerificationStatus.pending
     session.add(task)
 
 
@@ -129,29 +221,33 @@ async def _process_match_result(session: AsyncSession, system_task: Task) -> Non
     if not parent:
         return
 
-    try:
-        result_data = json.loads(system_task.result)
-        ranked_agents = result_data.get("ranked_agents", [])
-    except (json.JSONDecodeError, TypeError):
-        parent.match_status = "broadcast"
+    result_data = safe_json_loads(system_task.result)
+    if not result_data:
+        parent.match_status = MatchStatus.broadcast
         session.add(parent)
         return
 
+    ranked_agents = result_data.get("ranked_agents", [])
     if not ranked_agents:
-        parent.match_status = "broadcast"
+        parent.match_status = MatchStatus.broadcast
         session.add(parent)
         return
 
-    for rank, agent_id in enumerate(ranked_agents):
+    for rank, aid in enumerate(ranked_agents):
         tm = TaskMatch(
             id=make_match_id(),
             task_id=parent.id,
-            agent_id=agent_id,
+            agent_id=aid,
             rank=rank,
         )
         session.add(tm)
 
-    parent.match_status = "matched"
+    # Save extracted tags from the matching result
+    extracted_tags = result_data.get("extracted_tags", [])
+    if isinstance(extracted_tags, list) and extracted_tags:
+        parent.extracted_tags = json.dumps(extracted_tags[: settings.max_extracted_tags])
+
+    parent.match_status = MatchStatus.matched
     session.add(parent)
 
 
@@ -161,60 +257,138 @@ async def _process_verify_result(session: AsyncSession, system_task: Task) -> No
     if not parent:
         return
 
-    try:
-        result_data = json.loads(system_task.result)
-        meets = result_data.get("meets_requirements", False)
-    except (json.JSONDecodeError, TypeError):
-        parent.verification_status = "failed"
+    result_data = safe_json_loads(system_task.result)
+    if not result_data:
+        parent.verification_status = VerificationStatus.failed
         parent.verification_result = json.dumps(
             {"meets_requirements": False, "explanation": "Failed to parse verification result"}
         )
         session.add(parent)
         return
 
+    meets = result_data.get("meets_requirements", False)
     parent.verification_result = system_task.result
     if meets:
-        parent.verification_status = "passed"
+        parent.verification_status = VerificationStatus.passed
         # Auto-approve if still in delivered state
-        status = parent.status.value if isinstance(parent.status, TaskStatus) else parent.status
-        if status == "delivered":
-            credits = parent.credits_charged or 0
-            remaining = parent.max_credits - credits
-
-            await release_to_worker_with_fee(
-                session, parent.id, parent.worker_id, parent.poster_id,
-                credits, settings.platform_fee_percent,
-            )
-            if remaining > 0:
-                await refund(session, parent.id, parent.poster_id, remaining)
-
-            parent.status = TaskStatus.approved
-            await session.execute(
-                text("UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE id = :id"),
-                {"id": parent.worker_id},
-            )
+        if status_str(parent.status) == "delivered":
+            await finalize_task_approval(session, parent, settings.platform_fee_percent)
     else:
-        parent.verification_status = "failed"
+        parent.verification_status = VerificationStatus.failed
 
     session.add(parent)
 
 
-async def _auto_approve_system_task(session: AsyncSession, system_task: Task) -> None:
-    """Auto-approve a system task immediately (platform is both poster and approver)."""
-    credits = system_task.credits_charged or 0
-    if system_task.worker_id:
-        await release_to_worker(session, system_task.id, system_task.worker_id, credits)
-        remaining = system_task.max_credits - credits
-        if remaining > 0:
-            # No refund needed for system tasks (no escrow was taken)
-            pass
-        await session.execute(
-            text("UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE id = :id"),
-            {"id": system_task.worker_id},
-        )
+async def _maybe_spawn_capability_extraction(session: AsyncSession, agent: Agent) -> None:
+    """Create an extract_capabilities system task if any infra agents exist."""
+    infra_agents = await _get_infra_agents(session)
+    if not infra_agents:
+        return
 
-    system_task.status = TaskStatus.approved
+    need = (
+        f'Extract capability tags from this agent description: "{agent.good_at}"\n'
+        f"Agent ID: {agent.id}\n\n"
+        'Return JSON: {"agent_id": "...", "tags": ["tag1", "tag2", ...]}\n'
+        "tags: short lowercase keywords describing the agent's capabilities (max 20)."
+    )
+
+    system_tid = make_task_id()
+    system_task = Task(
+        id=system_tid,
+        poster_id=settings.platform_agent_id,
+        need=need,
+        context=json.dumps({"target_agent_id": agent.id}),
+        max_credits=settings.capability_extract_credits,
+        is_system=True,
+        system_task_type=SystemTaskType.extract_capabilities,
+        expires_at=datetime.now(UTC) + timedelta(hours=settings.task_expire_hours),
+    )
     session.add(system_task)
+
+
+async def _process_capability_result(session: AsyncSession, system_task: Task) -> None:
+    """Parse capability extraction result and save tags to the agent."""
+    result_data = safe_json_loads(system_task.result)
+    if not result_data:
+        return
+
+    agent_id = result_data.get("agent_id")
+    tags = result_data.get("tags", [])
+
+    if not isinstance(tags, list):
+        return
+
+    # Also try to get agent_id from context if not in result
+    if not agent_id and system_task.context:
+        ctx = safe_json_loads(system_task.context)
+        if ctx:
+            agent_id = ctx.get("target_agent_id")
+
+    if not agent_id:
+        return
+
+    agent = await session.get(Agent, agent_id)
+    if not agent:
+        return
+
+    agent.capability_tags = json.dumps(tags[: settings.max_extracted_tags])
+    session.add(agent)
+
+
+async def finalize_task_approval(session: AsyncSession, task: Task, fee_percent: float) -> None:
+    """Common approval logic: pay worker with fee, refund remaining, mark approved."""
+    credits = task.credits_charged or 0
+    remaining = task.max_credits - credits
+
+    await release_to_worker_with_fee(
+        session, task.id, task.worker_id, task.poster_id, credits, fee_percent
+    )
+    if remaining > 0:
+        await refund(session, task.id, task.poster_id, remaining)
+
+    task.status = TaskStatus.approved
+    session.add(task)
+    await increment_tasks_completed(session, task.worker_id)
+
+
+async def finalize_system_task_approval(session: AsyncSession, task: Task) -> None:
+    """Approve a system task, paying the worker if present."""
+    credits = task.credits_charged or 0
+    if task.worker_id:
+        await release_to_worker(session, task.id, task.worker_id, credits)
+        await increment_tasks_completed(session, task.worker_id)
+    task.status = TaskStatus.approved
+    session.add(task)
+
+
+# ---------------------------------------------------------------------------
+# Shared query helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_conflict_subquery(worker_id: str):
+    """Subquery: parent tasks where this agent did system work (conflict rule)."""
+    return select(Task.parent_task_id).where(
+        Task.is_system == True,  # noqa: E712
+        Task.worker_id == worker_id,
+        Task.parent_task_id != None,  # noqa: E711
+    )
+
+
+def _apply_tag_filters(query, tags: list[str] | None):
+    """Apply tag containment filters to a query."""
+    if tags:
+        for tag in tags:
+            query = query.where(Task.tags.contains(f'"{tag}"'))
+    return query
+
+
+def _load_agent_capability_tags(agent: Agent) -> set[str]:
+    """Load and lowercase an agent's capability tags."""
+    parsed = safe_json_loads(agent.capability_tags)
+    if parsed:
+        return {t.lower() for t in parsed}
+    return set()
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +403,16 @@ async def create_task(
     max_credits: int = 50,
     tags: list[str] | None = None,
     context: str | None = None,
+    deadline_minutes: int | None = None,
 ) -> dict:
     """Create a task and escrow credits atomically in one transaction."""
     tid = make_task_id()
     expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
     tags_json = json.dumps(tags) if tags else None
+
+    deadline = None
+    if deadline_minutes is not None:
+        deadline = datetime.now(UTC) + timedelta(minutes=deadline_minutes)
 
     task = Task(
         id=tid,
@@ -243,6 +422,7 @@ async def create_task(
         max_credits=max_credits,
         tags=tags_json,
         expires_at=expires_at,
+        deadline=deadline,
     )
     session.add(task)
     # Flush so the task row exists for FK on ledger
@@ -251,17 +431,17 @@ async def create_task(
     # Atomic escrow (Bug #1 fix — single UPDATE with balance check)
     await escrow(session, poster_id, tid, max_credits)
 
-    await session.execute(
-        text("UPDATE agents SET tasks_posted = tasks_posted + 1 WHERE id = :id"),
-        {"id": poster_id},
-    )
+    await increment_tasks_posted(session, poster_id)
 
     # Spawn matching system task
     await _maybe_spawn_matching(session, task)
 
     await session.commit()
 
-    return {"id": tid, "status": "posted", "need": need, "max_credits": max_credits}
+    result = {"id": tid, "status": "posted", "need": need, "max_credits": max_credits}
+    if deadline:
+        result["deadline"] = deadline.isoformat()
+    return result
 
 
 async def get_task(session: AsyncSession, tid: str) -> dict | None:
@@ -275,22 +455,22 @@ async def get_task(session: AsyncSession, tid: str) -> dict | None:
         "need": task.need,
         "context": task.context,
         "result": task.result,
-        "status": task.status.value if isinstance(task.status, TaskStatus) else task.status,
+        "status": status_str(task.status),
         "max_credits": task.max_credits,
         "credits_charged": task.credits_charged,
         "tags": task.tags,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "delivered_at": task.delivered_at.isoformat() if task.delivered_at else None,
         "expires_at": task.expires_at.isoformat() if task.expires_at else None,
+        "deadline": task.deadline.isoformat() if task.deadline else None,
     }
 
 
 def _check_abandon_cooldown(agent: Agent) -> None:
     """Raise 429 if agent has too many recent abandons."""
     if (
-        (agent.abandon_count or 0) >= settings.max_abandons_before_cooldown
-        and agent.last_abandon_at
-    ):
+        agent.abandon_count or 0
+    ) >= settings.max_abandons_before_cooldown and agent.last_abandon_at:
         last = agent.last_abandon_at
         # Ensure timezone-aware comparison (SQLite may strip tzinfo)
         if last.tzinfo is None:
@@ -303,8 +483,21 @@ def _check_abandon_cooldown(agent: Agent) -> None:
             )
 
 
+def _compute_tag_overlap(task: Task, agent_tags: set[str]) -> int:
+    """Count how many of the task's tags overlap with the agent's capability tags."""
+    task_tags: set[str] = set()
+    for field in (task.tags, task.extracted_tags):
+        parsed = safe_json_loads(field)
+        if parsed:
+            task_tags.update(parsed)
+    return len({t.lower() for t in task_tags} & agent_tags)
+
+
 async def pickup_task(
-    session: AsyncSession, worker_id: str, tags: list[str] | None = None
+    session: AsyncSession,
+    worker_id: str,
+    tags: list[str] | None = None,
+    search: str | None = None,
 ) -> dict | None:
     """Atomically claim the next available task with priority phases.
 
@@ -325,13 +518,7 @@ async def pickup_task(
         if task:
             return task
 
-    # Conflict rule: exclude tasks where this agent did system work
-    # (i.e., tasks whose parent_task_id points to a task where worker_id = me)
-    conflict_subquery = select(Task.parent_task_id).where(
-        Task.is_system == True,  # noqa: E712
-        Task.worker_id == worker_id,
-        Task.parent_task_id != None,  # noqa: E711
-    )
+    conflict_subquery = _build_conflict_subquery(worker_id)
 
     # Phase 1: Matched tasks (tasks where this agent has a TaskMatch row)
     matched_subquery = select(TaskMatch.task_id).where(TaskMatch.agent_id == worker_id)
@@ -339,14 +526,13 @@ async def pickup_task(
         Task.status == TaskStatus.posted,
         Task.poster_id != worker_id,
         Task.is_system == False,  # noqa: E712
-        Task.match_status == "matched",
+        Task.match_status == MatchStatus.matched,
         Task.id.in_(matched_subquery),
         Task.id.not_in(conflict_subquery),
     )
 
-    if tags:
-        for tag in tags:
-            query = query.where(Task.tags.contains(f'"{tag}"'))
+    query = _apply_tag_filters(query, tags)
+    query = _apply_search_filter(query, search)
 
     # Order by rank (join with TaskMatch)
     query = query.limit(10)
@@ -355,58 +541,71 @@ async def pickup_task(
 
     if matched_tasks:
         # Sort by match rank
+        rank_result = await session.execute(
+            select(TaskMatch.task_id, TaskMatch.rank).where(
+                TaskMatch.agent_id == worker_id,
+                TaskMatch.task_id.in_([t.id for t in matched_tasks]),
+            )
+        )
+        rank_map = {row[0]: row[1] for row in rank_result.fetchall()}
+        matched_tasks.sort(key=lambda t: rank_map.get(t.id, 999))
+
         for t in matched_tasks:
             claimed = await _try_claim(session, t, worker_id)
             if claimed:
                 return claimed
 
-    # Phase 2: Broadcast + pending tasks (FIFO)
+    agent_tags = _load_agent_capability_tags(agent)
+
+    # Phase 2: Broadcast + pending tasks (scored by tag overlap, poster rep, trust)
     query2 = (
         select(Task)
         .where(
             Task.status == TaskStatus.posted,
             Task.poster_id != worker_id,
             Task.is_system == False,  # noqa: E712
-            Task.match_status.in_(["broadcast", "pending"]),
+            Task.match_status.in_([MatchStatus.broadcast, MatchStatus.pending]),
             Task.id.not_in(conflict_subquery),
         )
         .order_by(Task.created_at.asc())
     )
 
-    if tags:
-        for tag in tags:
-            query2 = query2.where(Task.tags.contains(f'"{tag}"'))
+    query2 = _apply_tag_filters(query2, tags)
+    query2 = _apply_search_filter(query2, search)
 
-    query2 = query2.limit(1)
+    query2 = query2.limit(20)
     result2 = await session.execute(query2)
-    task2 = result2.scalar_one_or_none()
+    broadcast_tasks = list(result2.scalars().all())
 
-    if task2:
-        return await _try_claim(session, task2, worker_id)
-
-    # Phase 3: Tasks with no match_status (backwards compat / non-system tasks)
-    query3 = (
-        select(Task)
-        .where(
-            Task.status == TaskStatus.posted,
-            Task.poster_id != worker_id,
-            Task.is_system == False,  # noqa: E712
-            Task.match_status == None,  # noqa: E711
-            Task.id.not_in(conflict_subquery),
+    if broadcast_tasks:
+        # Batch-fetch poster reputations
+        poster_ids = list({t.poster_id for t in broadcast_tasks})
+        rep_result = await session.execute(
+            select(Agent.id, Agent.reputation).where(Agent.id.in_(poster_ids))
         )
-        .order_by(Task.created_at.asc())
-        .limit(1)
-    )
+        rep_map = {row[0]: row[1] for row in rep_result.fetchall()}
 
-    if tags:
-        for tag in tags:
-            query3 = query3.where(Task.tags.contains(f'"{tag}"'))
+        # Batch-fetch trust scores (poster→worker)
+        trust_result = await session.execute(
+            select(AgentTrust.truster_id, AgentTrust.score).where(
+                AgentTrust.truster_id.in_(poster_ids),
+                AgentTrust.trusted_id == worker_id,
+            )
+        )
+        trust_map = {row[0]: row[1] for row in trust_result.fetchall()}
 
-    result3 = await session.execute(query3)
-    task3 = result3.scalar_one_or_none()
+        def _sort_key(t: Task):
+            tag_score = -_compute_tag_overlap(t, agent_tags) if agent_tags else 0
+            poster_rep = -(rep_map.get(t.poster_id, 0.0))
+            trust_score = -(trust_map.get(t.poster_id, 0.5))
+            return (tag_score, poster_rep, trust_score, t.created_at)
 
-    if task3:
-        return await _try_claim(session, task3, worker_id)
+        broadcast_tasks.sort(key=_sort_key)
+
+        for t in broadcast_tasks:
+            claimed = await _try_claim(session, t, worker_id)
+            if claimed:
+                return claimed
 
     return None
 
@@ -445,24 +644,33 @@ async def _try_claim(session: AsyncSession, task: Task, worker_id: str) -> dict 
     await session.commit()
     await session.refresh(task)
 
+    # Enrich with poster reputation
+    poster = await session.get(Agent, task.poster_id)
+    poster_rep = poster.reputation if poster else None
+
+    # Parse tags
+    tags_parsed = safe_json_loads(task.tags)
+
     return {
         "task_id": task.id,
         "poster_id": task.poster_id,
         "need": task.need,
         "context": task.context,
         "max_credits": task.max_credits,
+        "tags": tags_parsed,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "poster_reputation": poster_rep,
+        "deadline": task.deadline.isoformat() if task.deadline else None,
     }
 
 
-async def pickup_specific_task(
-    session: AsyncSession, task_id: str, worker_id: str
-) -> dict | None:
+async def pickup_specific_task(session: AsyncSession, task_id: str, worker_id: str) -> dict | None:
     """Claim a specific task by ID. Validates eligibility."""
     task = await session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "posted":
         raise HTTPException(status_code=409, detail=f"Task is {status}, not posted")
 
@@ -481,9 +689,7 @@ async def pickup_specific_task(
         )
     )
     if conflict_result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409, detail="Conflict: you did system work on this task"
-        )
+        raise HTTPException(status_code=409, detail="Conflict: you did system work on this task")
 
     # Check abandon cooldown
     agent = await session.get(Agent, worker_id)
@@ -507,7 +713,7 @@ async def deliver_task(
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "claimed":
         raise HTTPException(status_code=409, detail=f"Task is {status}, not claimed")
     if task.worker_id != worker_id:
@@ -525,12 +731,15 @@ async def deliver_task(
     session.add(task)
 
     # Process system task results
-    if task.is_system and task.system_task_type == "match_agents":
+    if task.is_system and task.system_task_type == SystemTaskType.match_agents:
         await _process_match_result(session, task)
-        await _auto_approve_system_task(session, task)
-    elif task.is_system and task.system_task_type == "verify_completion":
+        await finalize_system_task_approval(session, task)
+    elif task.is_system and task.system_task_type == SystemTaskType.verify_completion:
         await _process_verify_result(session, task)
-        await _auto_approve_system_task(session, task)
+        await finalize_system_task_approval(session, task)
+    elif task.is_system and task.system_task_type == SystemTaskType.extract_capabilities:
+        await _process_capability_result(session, task)
+        await finalize_system_task_approval(session, task)
     else:
         # Regular task: spawn verification
         await _maybe_spawn_verification(session, task)
@@ -570,29 +779,13 @@ async def approve_task(
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "delivered":
         raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
-    credits = task.credits_charged or 0
-    remaining = task.max_credits - credits
-
-    await release_to_worker_with_fee(
-        session, tid, task.worker_id, poster_id, credits, settings.platform_fee_percent,
-    )
-    if remaining > 0:
-        await refund(session, tid, poster_id, remaining)
-
-    task.status = TaskStatus.approved
-    session.add(task)
-
-    # Bug #3 fix: increment tasks_completed on approve, not deliver
-    await session.execute(
-        text("UPDATE agents SET tasks_completed = tasks_completed + 1 WHERE id = :id"),
-        {"id": task.worker_id},
-    )
+    await finalize_task_approval(session, task, settings.platform_fee_percent)
 
     # Optional rating
     if rating is not None:
@@ -600,8 +793,14 @@ async def approve_task(
         session.add(r)
         await update_reputation(session, task.worker_id)
 
+    # Update trust bidirectionally (positive)
+    from pinchwork.services.trust import update_trust
+
+    await update_trust(session, poster_id, task.worker_id, positive=True)
+    await update_trust(session, task.worker_id, poster_id, positive=True)
+
     await session.commit()
-    _cleanup_event(tid)
+    cleanup_task_event(tid)
 
     # SSE: notify worker that task was approved
     event_bus.publish(task.worker_id, Event(type="task_approved", task_id=tid))
@@ -624,45 +823,69 @@ async def approve_task(
     return result_dict
 
 
-async def reject_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
+async def reject_task(
+    session: AsyncSession,
+    tid: str,
+    poster_id: str,
+    reason: str,
+    feedback: str | None = None,
+) -> dict:
     """Reject delivery, reset task to posted with fresh expiry."""
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "delivered":
         raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
-    # Capture worker_id before clearing for SSE notification
+    # Keep worker assigned during grace period so they can re-deliver
     rejected_worker_id = task.worker_id
+    grace_deadline = datetime.now(UTC) + timedelta(minutes=settings.rejection_grace_minutes)
 
-    # Bug #2 fix: reset expires_at to fresh window
-    task.status = TaskStatus.posted
-    task.worker_id = None
+    task.status = TaskStatus.claimed
+    # worker_id stays set — worker keeps the claim during grace period
     task.result = None
     task.credits_charged = None
     task.delivered_at = None
-    task.claimed_at = None
-    task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
+    task.rejection_reason = reason
+    task.rejection_count = (task.rejection_count or 0) + 1
+    task.rejection_grace_deadline = grace_deadline
     session.add(task)
+
+    # Update trust poster→worker (negative)
+    from pinchwork.services.trust import update_trust
+
+    if rejected_worker_id:
+        await update_trust(session, poster_id, rejected_worker_id, positive=False)
+
     await session.commit()
 
-    # SSE: notify worker that task was rejected
+    # SSE: notify worker that task was rejected (with grace deadline)
     if rejected_worker_id:
-        event_bus.publish(rejected_worker_id, Event(type="task_rejected", task_id=tid))
+        event_bus.publish(
+            rejected_worker_id,
+            Event(
+                type="task_rejected",
+                task_id=tid,
+                data={"reason": reason, "grace_deadline": grace_deadline.isoformat()},
+            ),
+        )
 
     return {
         "id": task.id,
         "poster_id": task.poster_id,
-        "worker_id": None,
+        "worker_id": rejected_worker_id,
         "need": task.need,
         "context": task.context,
         "result": None,
-        "status": "posted",
+        "status": "claimed",
         "max_credits": task.max_credits,
         "credits_charged": None,
+        "rejection_reason": reason,
+        "rejection_count": task.rejection_count,
+        "rejection_grace_deadline": grace_deadline.isoformat(),
     }
 
 
@@ -671,7 +894,7 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "posted":
         raise HTTPException(
             status_code=409, detail=f"Task is {status}, can only cancel posted tasks"
@@ -680,9 +903,7 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
         raise HTTPException(status_code=403, detail="Not your task")
 
     # Collect matched agent IDs before commit for SSE notification
-    match_result = await session.execute(
-        select(TaskMatch.agent_id).where(TaskMatch.task_id == tid)
-    )
+    match_result = await session.execute(select(TaskMatch.agent_id).where(TaskMatch.task_id == tid))
     matched_agent_ids = [row[0] for row in match_result.fetchall()]
 
     task.status = TaskStatus.cancelled
@@ -690,12 +911,10 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
 
     await refund(session, tid, poster_id, task.max_credits)
     await session.commit()
-    _cleanup_event(tid)
+    cleanup_task_event(tid)
 
     # SSE: notify matched agents that task was cancelled
-    event_bus.publish_many(
-        matched_agent_ids, Event(type="task_cancelled", task_id=tid)
-    )
+    event_bus.publish_many(matched_agent_ids, Event(type="task_cancelled", task_id=tid))
 
     return {
         "id": task.id,
@@ -715,7 +934,7 @@ async def abandon_task(session: AsyncSession, tid: str, worker_id: str) -> dict:
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "claimed":
         raise HTTPException(status_code=409, detail=f"Task is {status}, not claimed")
     if task.worker_id != worker_id:
@@ -725,7 +944,7 @@ async def abandon_task(session: AsyncSession, tid: str, worker_id: str) -> dict:
     task.worker_id = None
     task.claimed_at = None
     task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
-    task.match_status = "broadcast"
+    task.match_status = MatchStatus.broadcast
     session.add(task)
 
     # Track abandon on the worker
@@ -758,7 +977,7 @@ async def wait_for_result(session: AsyncSession, tid: str, timeout: int) -> dict
     await session.expire_all()
     task = await session.get(Task, tid)
     if task:
-        status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+        status = status_str(task.status)
         if status in ("delivered", "approved"):
             return {
                 "id": task.id,
@@ -774,10 +993,19 @@ async def wait_for_result(session: AsyncSession, tid: str, timeout: int) -> dict
     return await get_task(session, tid)
 
 
+def _apply_search_filter(query, search: str | None):
+    """Apply case-insensitive text search on need and context."""
+    if search:
+        term = f"%{search}%"
+        query = query.where((Task.need.ilike(term)) | (Task.context.ilike(term)))
+    return query
+
+
 async def list_available_tasks(
     session: AsyncSession,
     worker_id: str,
     tags: list[str] | None = None,
+    search: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ) -> dict:
@@ -786,12 +1014,7 @@ async def list_available_tasks(
     if not agent:
         return {"tasks": [], "total": 0}
 
-    # Conflict rule: exclude tasks where this agent did system work
-    conflict_subquery = select(Task.parent_task_id).where(
-        Task.is_system == True,  # noqa: E712
-        Task.worker_id == worker_id,
-        Task.parent_task_id != None,  # noqa: E711
-    )
+    conflict_subquery = _build_conflict_subquery(worker_id)
 
     # Phase 1: Matched tasks
     matched_subquery = select(TaskMatch.task_id).where(TaskMatch.agent_id == worker_id)
@@ -799,7 +1022,7 @@ async def list_available_tasks(
         Task.status == TaskStatus.posted,
         Task.poster_id != worker_id,
         Task.is_system == False,  # noqa: E712
-        Task.match_status == "matched",
+        Task.match_status == MatchStatus.matched,
         Task.id.in_(matched_subquery),
         Task.id.not_in(conflict_subquery),
     )
@@ -809,49 +1032,67 @@ async def list_available_tasks(
         Task.status == TaskStatus.posted,
         Task.poster_id != worker_id,
         Task.is_system == False,  # noqa: E712
-        Task.match_status.in_(["broadcast", "pending"]),
+        Task.match_status.in_([MatchStatus.broadcast, MatchStatus.pending]),
         Task.id.not_in(conflict_subquery),
     )
 
-    # Phase 3: Tasks with no match_status (backwards compat)
-    q_none = select(Task).where(
-        Task.status == TaskStatus.posted,
-        Task.poster_id != worker_id,
-        Task.is_system == False,  # noqa: E712
-        Task.match_status == None,  # noqa: E711
-        Task.id.not_in(conflict_subquery),
-    )
-
-    # Apply tag filters
-    for q_ref in [q_matched, q_broadcast, q_none]:
-        if tags:
-            for tag in tags:
-                q_ref = q_ref.where(Task.tags.contains(f'"{tag}"'))
+    # Apply tag and search filters
+    q_matched = _apply_tag_filters(q_matched, tags)
+    q_broadcast = _apply_tag_filters(q_broadcast, tags)
+    q_matched = _apply_search_filter(q_matched, search)
+    q_broadcast = _apply_search_filter(q_broadcast, search)
 
     # Gather all tasks in priority order
-    if tags:
-        # Rebuild with tags applied
-        q_matched_filtered = q_matched
-        q_broadcast_filtered = q_broadcast
-        q_none_filtered = q_none
-        for tag in tags:
-            q_matched_filtered = q_matched_filtered.where(Task.tags.contains(f'"{tag}"'))
-            q_broadcast_filtered = q_broadcast_filtered.where(Task.tags.contains(f'"{tag}"'))
-            q_none_filtered = q_none_filtered.where(Task.tags.contains(f'"{tag}"'))
-        r1 = await session.execute(q_matched_filtered)
-        r2 = await session.execute(q_broadcast_filtered.order_by(Task.created_at.asc()))
-        r3 = await session.execute(q_none_filtered.order_by(Task.created_at.asc()))
-    else:
-        r1 = await session.execute(q_matched)
-        r2 = await session.execute(q_broadcast.order_by(Task.created_at.asc()))
-        r3 = await session.execute(q_none.order_by(Task.created_at.asc()))
+    r1 = await session.execute(q_matched)
+    r2 = await session.execute(q_broadcast.order_by(Task.created_at.asc()))
 
-    all_tasks = list(r1.scalars().all()) + list(r2.scalars().all()) + list(r3.scalars().all())
+    matched_tasks = list(r1.scalars().all())
+    broadcast_tasks = list(r2.scalars().all())
+
+    # Sort matched tasks by rank
+    if matched_tasks:
+        rank_result = await session.execute(
+            select(TaskMatch.task_id, TaskMatch.rank).where(
+                TaskMatch.agent_id == worker_id,
+                TaskMatch.task_id.in_([t.id for t in matched_tasks]),
+            )
+        )
+        rank_map = {row[0]: row[1] for row in rank_result.fetchall()}
+        matched_tasks.sort(key=lambda t: rank_map.get(t.id, 999))
+
+    agent_tags = _load_agent_capability_tags(agent)
+
+    # Sort broadcast tasks by tag overlap (if agent has capability tags)
+    if agent_tags and broadcast_tasks:
+        broadcast_tasks.sort(key=lambda t: (-_compute_tag_overlap(t, agent_tags), t.created_at))
+
+    # Batch-fetch poster reputations
+    all_tasks = matched_tasks + broadcast_tasks
+    poster_ids = list({t.poster_id for t in all_tasks})
+    rep_map: dict[str, float] = {}
+    if poster_ids:
+        rep_result = await session.execute(
+            select(Agent.id, Agent.reputation).where(Agent.id.in_(poster_ids))
+        )
+        rep_map = {row[0]: row[1] for row in rep_result.fetchall()}
+
+    # Build match info map
+    matched_task_ids = {t.id for t in matched_tasks}
+    match_rank_map: dict[str, int] = {}
+    if matched_tasks:
+        mr = await session.execute(
+            select(TaskMatch.task_id, TaskMatch.rank).where(
+                TaskMatch.agent_id == worker_id,
+                TaskMatch.task_id.in_(list(matched_task_ids)),
+            )
+        )
+        match_rank_map = {row[0]: row[1] for row in mr.fetchall()}
+
     total = len(all_tasks)
     page = all_tasks[offset : offset + limit]
 
     def _task_to_dict(t: Task) -> dict:
-        tags_parsed = json.loads(t.tags) if t.tags else None
+        tags_parsed = safe_json_loads(t.tags)
         return {
             "task_id": t.id,
             "need": t.need,
@@ -860,6 +1101,11 @@ async def list_available_tasks(
             "tags": tags_parsed,
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "poster_id": t.poster_id,
+            "poster_reputation": rep_map.get(t.poster_id),
+            "is_matched": t.id in matched_task_ids,
+            "match_rank": match_rank_map.get(t.id),
+            "rejection_count": t.rejection_count or 0,
+            "deadline": t.deadline.isoformat() if t.deadline else None,
         }
 
     return {"tasks": [_task_to_dict(t) for t in page], "total": total}
@@ -903,7 +1149,7 @@ async def list_my_tasks(
     page = all_tasks[offset : offset + limit]
 
     def _task_to_response(t: Task) -> dict:
-        s = t.status.value if isinstance(t.status, TaskStatus) else t.status
+        s = status_str(t.status)
         return {
             "task_id": t.id,
             "status": s,
@@ -918,12 +1164,14 @@ async def list_my_tasks(
     return {"tasks": [_task_to_response(t) for t in page], "total": total}
 
 
-async def create_report(
-    session: AsyncSession, task_id: str, reporter_id: str, reason: str
-) -> dict:
+async def create_report(session: AsyncSession, task_id: str, reporter_id: str, reason: str) -> dict:
     task = await session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Only poster or worker may report a task
+    if reporter_id != task.poster_id and reporter_id != task.worker_id:
+        raise HTTPException(status_code=403, detail="Only poster or worker may report this task")
 
     rid = make_report_id()
     report = Report(id=rid, task_id=task_id, reporter_id=reporter_id, reason=reason)
@@ -945,7 +1193,7 @@ async def rate_poster(
     task = await session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+    status = status_str(task.status)
     if status != "approved":
         raise HTTPException(
             status_code=409,
@@ -969,9 +1217,212 @@ async def rate_poster(
     )
     session.add(r)
     await update_reputation(session, task.poster_id)
+
+    # Update trust worker→poster based on rating
+    from pinchwork.services.trust import update_trust
+
+    await update_trust(session, worker_id, task.poster_id, positive=(rating >= 3))
+
     await session.commit()
 
     result = {"task_id": task_id, "rated_id": task.poster_id, "rating": rating}
     if feedback:
         result["feedback"] = feedback
     return result
+
+
+# ---------------------------------------------------------------------------
+# Task Questions (pre-pickup clarification)
+# ---------------------------------------------------------------------------
+
+MAX_UNANSWERED_QUESTIONS = 5
+
+
+def _question_to_dict(q: TaskQuestion) -> dict:
+    return {
+        "id": q.id,
+        "task_id": q.task_id,
+        "asker_id": q.asker_id,
+        "question": q.question,
+        "answer": q.answer,
+        "created_at": q.created_at.isoformat() if q.created_at else None,
+        "answered_at": q.answered_at.isoformat() if q.answered_at else None,
+    }
+
+
+async def ask_question(session: AsyncSession, task_id: str, asker_id: str, question: str) -> dict:
+    """Ask a question about a task before picking it up."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.poster_id == asker_id:
+        raise HTTPException(status_code=409, detail="Cannot ask questions on your own task")
+    if status_str(task.status) != "posted":
+        raise HTTPException(status_code=409, detail="Can only ask questions on posted tasks")
+
+    # Check unanswered question limit
+    unanswered = await session.execute(
+        select(TaskQuestion).where(
+            TaskQuestion.task_id == task_id,
+            TaskQuestion.answer.is_(None),
+        )
+    )
+    if len(unanswered.scalars().all()) >= MAX_UNANSWERED_QUESTIONS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Max {MAX_UNANSWERED_QUESTIONS} unanswered questions per task",
+        )
+
+    qid = make_question_id()
+    tq = TaskQuestion(id=qid, task_id=task_id, asker_id=asker_id, question=question)
+    session.add(tq)
+    await session.commit()
+
+    # SSE: notify poster
+    event_bus.publish(
+        task.poster_id, Event(type="task_question", task_id=task_id, data={"question_id": qid})
+    )
+
+    return _question_to_dict(tq)
+
+
+async def answer_question(
+    session: AsyncSession, task_id: str, question_id: str, poster_id: str, answer: str
+) -> dict:
+    """Answer a question on your task."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.poster_id != poster_id:
+        raise HTTPException(status_code=403, detail="Only the poster can answer questions")
+
+    tq = await session.get(TaskQuestion, question_id)
+    if not tq or tq.task_id != task_id:
+        raise HTTPException(status_code=404, detail="Question not found")
+    if tq.answer is not None:
+        raise HTTPException(status_code=409, detail="Question already answered")
+
+    tq.answer = answer
+    tq.answered_at = datetime.now(UTC)
+    session.add(tq)
+    await session.commit()
+
+    # SSE: notify asker
+    event_bus.publish(
+        tq.asker_id,
+        Event(type="question_answered", task_id=task_id, data={"question_id": question_id}),
+    )
+
+    return _question_to_dict(tq)
+
+
+async def list_questions(session: AsyncSession, task_id: str) -> list[dict]:
+    """List all questions for a task."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    result = await session.execute(
+        select(TaskQuestion)
+        .where(TaskQuestion.task_id == task_id)
+        .order_by(TaskQuestion.created_at.asc())
+    )
+    return [_question_to_dict(q) for q in result.scalars().all()]
+
+
+# ---------------------------------------------------------------------------
+# Mid-Task Messaging
+# ---------------------------------------------------------------------------
+
+
+async def send_message(
+    session: AsyncSession, task_id: str, sender_id: str, message: str
+) -> dict:
+    """Send a message on a claimed or delivered task (poster/worker only)."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    status = status_str(task.status)
+    if status not in ("claimed", "delivered"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is {status}, messages only allowed on claimed/delivered tasks",
+        )
+
+    if sender_id != task.poster_id and sender_id != task.worker_id:
+        raise HTTPException(status_code=403, detail="Only poster or worker can send messages")
+
+    mid = make_message_id()
+    msg = TaskMessage(
+        id=mid,
+        task_id=task_id,
+        sender_id=sender_id,
+        message=message,
+    )
+    session.add(msg)
+    await session.commit()
+
+    # SSE: notify the other party
+    recipient = task.worker_id if sender_id == task.poster_id else task.poster_id
+    if recipient:
+        event_bus.publish(
+            recipient,
+            Event(type="task_message", task_id=task_id, data={"message_id": mid}),
+        )
+
+    return {
+        "id": mid,
+        "task_id": task_id,
+        "sender_id": sender_id,
+        "message": message,
+        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    }
+
+
+async def list_messages(session: AsyncSession, task_id: str, agent_id: str) -> list[dict]:
+    """List messages for a task (poster/worker only, also readable on approved tasks)."""
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if agent_id != task.poster_id and agent_id != task.worker_id:
+        raise HTTPException(status_code=403, detail="Only poster or worker can view messages")
+
+    result = await session.execute(
+        select(TaskMessage)
+        .where(TaskMessage.task_id == task_id)
+        .order_by(TaskMessage.created_at.asc())
+    )
+    return [
+        {
+            "id": m.id,
+            "task_id": m.task_id,
+            "sender_id": m.sender_id,
+            "message": m.message,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in result.scalars().all()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Batch Pickup
+# ---------------------------------------------------------------------------
+
+
+async def pickup_batch(
+    session: AsyncSession,
+    worker_id: str,
+    count: int = 5,
+    tags: list[str] | None = None,
+    search: str | None = None,
+) -> list[dict]:
+    """Pick up multiple tasks at once. Each claim is individually atomic."""
+    results: list[dict] = []
+    for _ in range(count):
+        task = await pickup_task(session, worker_id, tags=tags, search=search)
+        if not task:
+            break
+        results.append(task)
+    return results

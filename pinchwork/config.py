@@ -11,9 +11,10 @@ class Settings(BaseSettings):
     max_wait_seconds: int = 300
     match_timeout_seconds: int = 120
     system_task_auto_approve_seconds: int = 60
-    platform_agent_id: str = "ag_platform"
+    platform_agent_id: str = "ag-platform"
     match_credits: int = 3
     verify_credits: int = 5
+    capability_extract_credits: int = 2
     platform_fee_percent: float = 10.0
     admin_key: str | None = None
     disable_auto_approve: bool = False
@@ -23,6 +24,11 @@ class Settings(BaseSettings):
     rate_limit_create: str = "30/minute"
     rate_limit_pickup: str = "60/minute"
     rate_limit_deliver: str = "30/minute"
+    max_extracted_tags: int = 20
+    rejection_grace_minutes: int = 5
+    task_preview_length: int = 80
+    webhook_timeout_seconds: int = 10
+    webhook_max_retries: int = 3
 
     model_config = {"env_prefix": "PINCHWORK_"}
 

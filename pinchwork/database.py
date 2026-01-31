@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import SQLModel
@@ -12,11 +13,16 @@ from sqlmodel import SQLModel
 from pinchwork.config import settings
 from pinchwork.db_models import (  # noqa: F401 — register tables
     Agent,
+    AgentTrust,
     CreditLedger,
+    MatchStatus,
     Rating,
     Report,
+    SystemTaskType,
     Task,
     TaskMatch,
+    TaskMessage,
+    VerificationStatus,
 )
 
 logger = logging.getLogger("pinchwork.database")
@@ -30,14 +36,14 @@ async def init_db(url: str = "sqlite+aiosqlite:///pinchwork.db") -> None:
     connect_args = {}
     if "sqlite" in url:
         connect_args["check_same_thread"] = False
-    _engine = create_async_engine(url, echo=False, connect_args=connect_args)
+    _engine = create_async_engine(url, echo=False, connect_args=connect_args, pool_pre_ping=True)
     _session_factory = sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)  # type: ignore[call-overload]
 
     async with _engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
         if "sqlite" in url:
-            await conn.execute(__import__("sqlalchemy").text("PRAGMA journal_mode=WAL"))
-            await conn.execute(__import__("sqlalchemy").text("PRAGMA foreign_keys=ON"))
+            await conn.execute(text("PRAGMA journal_mode=WAL"))
+            await conn.execute(text("PRAGMA foreign_keys=ON"))
 
     await _ensure_platform_agent()
 

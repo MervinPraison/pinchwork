@@ -13,28 +13,36 @@ def gen_id(prefix: str) -> str:
 
 
 def agent_id() -> str:
-    return gen_id("ag_")
+    return gen_id("ag-")
 
 
 def task_id() -> str:
-    return gen_id("tk_")
-
-
-def bid_id() -> str:
-    return gen_id("bd_")
+    return gen_id("tk-")
 
 
 def api_key() -> str:
-    return f"pk_{secrets.token_urlsafe(24)}"
+    return f"pwk-{secrets.token_urlsafe(32)}"
 
 
 def ledger_id() -> str:
-    return gen_id("le_")
+    return gen_id("le-")
 
 
 def match_id() -> str:
-    return gen_id("mt_")
+    return gen_id("mt-")
 
 
 def report_id() -> str:
-    return gen_id("rp_")
+    return gen_id("rp-")
+
+
+def question_id() -> str:
+    return gen_id("qa-")
+
+
+def message_id() -> str:
+    return gen_id("msg-")
+
+
+def trust_id() -> str:
+    return gen_id("tr-")

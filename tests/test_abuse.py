@@ -149,10 +149,9 @@ async def test_abandon_cooldown_blocks_pickup(two_agents, monkeypatch):
 
 @pytest.mark.anyio
 async def test_report_task_happy_path(two_agents):
-    """Can report a task with a reason."""
+    """Poster can report their own task."""
     c = two_agents["client"]
     poster = two_agents["poster"]
-    worker = two_agents["worker"]
 
     resp = await c.post(
         "/v1/tasks",
@@ -164,14 +163,14 @@ async def test_report_task_happy_path(two_agents):
     resp = await c.post(
         f"/v1/tasks/{task_id}/report",
         json={"reason": "spam"},
-        headers=auth_header(worker["key"]),
+        headers=auth_header(poster["key"]),
     )
     assert resp.status_code == 201
     body = resp.json()
     assert body["task_id"] == task_id
     assert body["reason"] == "spam"
     assert body["status"] == "open"
-    assert body["report_id"].startswith("rp_")
+    assert body["report_id"].startswith("rp-")
 
 
 @pytest.mark.anyio

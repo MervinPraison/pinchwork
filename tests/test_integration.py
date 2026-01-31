@@ -46,6 +46,9 @@ async def _pickup_system_tasks(client, infra, worker_id=None):
         elif "Verify completion" in need:
             result = json.dumps({"meets_requirements": True, "explanation": "Looks good"})
             task_type = "verify_completion"
+        elif "Extract capability tags" in need:
+            result = json.dumps({"agent_id": "x", "tags": []})
+            task_type = "extract_capabilities"
         else:
             break  # Not a system task
 
@@ -80,7 +83,7 @@ async def test_skill_md_documents_new_features(client, db):
     assert "PATCH" in body
     assert "good_at" in body
     assert "accepts_system_tasks" in body
-    assert "Infra Agents" in body
+    assert "Infra Agent" in body
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +93,16 @@ async def test_skill_md_documents_new_features(client, db):
 
 @pytest.mark.asyncio
 async def test_register_with_capabilities(client, db):
-    agent = await _reg(client, "skilled", good_at="Dutch translation", accepts_system_tasks=True)
+    agent = await _reg(
+        client,
+        "skilled",
+        good_at="security auditing, OWASP Top 10",
+        accepts_system_tasks=True,
+    )
 
     resp = await client.get("/v1/me", headers=auth_header(agent["api_key"]))
     me = resp.json()
-    assert me["good_at"] == "Dutch translation"
+    assert me["good_at"] == "security auditing, OWASP Top 10"
     assert me["accepts_system_tasks"] is True
 
 
@@ -122,54 +130,62 @@ async def test_patch_me_updates_capabilities(client, db):
 async def test_full_matching_and_verification_cycle(client, db):
     """End-to-end: create -> match -> pickup -> deliver -> verify -> auto-approve."""
     infra = await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
-    worker = await _reg(client, "worker", good_at="Dutch translation")
+    worker = await _reg(client, "worker", good_at="security auditing, OWASP, Python")
     poster = await _reg(client, "poster")
 
     # 1. Create task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Translate to Dutch", "max_credits": 20},
+        json={"need": "Review this API endpoint for injection vulnerabilities", "max_credits": 20},
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 201
     task_id = resp.json()["task_id"]
 
-    # 2. Infra picks up match_agents system task
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    assert resp.status_code == 200
-    sys_pickup = resp.json()
-    assert sys_pickup["poster_id"] == "ag_platform"
-    assert "Match agents for:" in sys_pickup["need"]
+    # 2. Drain any non-match system tasks, then process match
+    await _pickup_system_tasks(client, infra, worker_id=worker["agent_id"])
 
-    # 3. Deliver match result
-    match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
-    resp = await client.post(
-        f"/v1/tasks/{sys_pickup['task_id']}/deliver",
-        json={"result": match_result},
-        headers=auth_header(infra["api_key"]),
-    )
-    assert resp.status_code == 200
-
-    # 4. Matched worker picks up the task
+    # 3. Matched worker picks up the task
     resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
     assert resp.status_code == 200
     assert resp.json()["task_id"] == task_id
 
-    # 5. Worker delivers
+    # 4. Worker delivers
     resp = await client.post(
         f"/v1/tasks/{task_id}/deliver",
-        json={"result": "Dit is de vertaling."},
+        json={
+            "result": (
+                "CRITICAL: SQL injection in line 4 (CWE-89)."
+                " HIGH: No auth check (CWE-306)."
+                " HIGH: No input validation (CWE-20)."
+            ),
+        },
         headers=auth_header(worker["api_key"]),
     )
     assert resp.status_code == 200
 
-    # 6. Infra picks up verify_completion system task
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    assert resp.status_code == 200
-    assert "Verify completion" in resp.json()["need"]
-    verify_tid = resp.json()["task_id"]
+    # 5. Infra picks up verify_completion system task
+    # (drain any remaining extraction tasks first)
+    found_verify = False
+    for _ in range(5):
+        resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+        if resp.status_code == 204:
+            break
+        data = resp.json()
+        if "Verify completion" in data["need"]:
+            found_verify = True
+            verify_tid = data["task_id"]
+            break
+        # Deliver non-verify system tasks
+        await client.post(
+            f"/v1/tasks/{data['task_id']}/deliver",
+            json={"result": json.dumps({"agent_id": "x", "tags": []})},
+            headers=auth_header(infra["api_key"]),
+        )
 
-    # 7. Deliver verification (pass)
+    assert found_verify, "Expected verify_completion task"
+
+    # 6. Deliver verification (pass)
     verify_result = json.dumps({"meets_requirements": True, "explanation": "Correct"})
     resp = await client.post(
         f"/v1/tasks/{verify_tid}/deliver",
@@ -178,7 +194,7 @@ async def test_full_matching_and_verification_cycle(client, db):
     )
     assert resp.status_code == 200
 
-    # 8. Task should be auto-approved
+    # 7. Task should be auto-approved
     async with db() as session:
         task = await session.get(Task, task_id)
         status = task.status.value if isinstance(task.status, TaskStatus) else task.status
@@ -316,43 +332,57 @@ async def test_regular_agent_never_sees_system_tasks(client, db):
 async def test_verification_failed_leaves_task_delivered(client, db):
     """Failed verification flags but doesn't reject — poster decides."""
     infra = await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
-    worker = await _reg(client, "worker", good_at="translation")
+    worker = await _reg(client, "worker", good_at="image generation, DALL-E")
     poster = await _reg(client, "poster")
 
     # Create, match, pickup, deliver
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Verify fail test", "max_credits": 10},
+        json={
+            "need": "Generate architecture diagram: 3 microservices via message queue",
+            "max_credits": 10,
+        },
         headers=auth_header(poster["api_key"]),
     )
     task_id = resp.json()["task_id"]
 
-    # Process match system task
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    sys_id = resp.json()["task_id"]
-    match = json.dumps({"ranked_agents": [worker["agent_id"]]})
-    await client.post(
-        f"/v1/tasks/{sys_id}/deliver", json={"result": match}, headers=auth_header(infra["api_key"])
-    )
+    # Process all system tasks (match, extraction, etc.)
+    await _pickup_system_tasks(client, infra, worker_id=worker["agent_id"])
 
     # Worker picks up and delivers
     resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
     assert resp.json()["task_id"] == task_id
     await client.post(
         f"/v1/tasks/{task_id}/deliver",
-        json={"result": "Bad work"},
+        json={"result": "Here is your diagram: [broken link]"},
         headers=auth_header(worker["api_key"]),
     )
 
-    # Infra picks up verification, delivers FAIL
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    assert "Verify completion" in resp.json()["need"]
-    fail_result = json.dumps({"meets_requirements": False, "explanation": "Quality too low"})
-    await client.post(
-        f"/v1/tasks/{resp.json()['task_id']}/deliver",
-        json={"result": fail_result},
-        headers=auth_header(infra["api_key"]),
-    )
+    # Infra picks up verification (drain any extraction tasks first)
+    found_verify = False
+    for _ in range(5):
+        resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+        if resp.status_code == 204:
+            break
+        data = resp.json()
+        if "Verify completion" in data["need"]:
+            found_verify = True
+            fail_result = json.dumps(
+                {"meets_requirements": False, "explanation": "Quality too low"}
+            )
+            await client.post(
+                f"/v1/tasks/{data['task_id']}/deliver",
+                json={"result": fail_result},
+                headers=auth_header(infra["api_key"]),
+            )
+            break
+        await client.post(
+            f"/v1/tasks/{data['task_id']}/deliver",
+            json={"result": json.dumps({"agent_id": "x", "tags": []})},
+            headers=auth_header(infra["api_key"]),
+        )
+
+    assert found_verify, "Expected verify_completion task"
 
     # Task should still be delivered (not auto-approved, not rejected)
     async with db() as session:
@@ -373,13 +403,13 @@ async def test_verification_failed_leaves_task_delivered(client, db):
 async def test_poster_approves_before_verification(client, db):
     """Poster can approve immediately without waiting for verification."""
     await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
-    worker = await _reg(client, "worker", good_at="translation")
+    worker = await _reg(client, "worker", good_at="Twilio SMS, notifications")
     poster = await _reg(client, "poster")
 
     # Create task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Approve early", "max_credits": 10},
+        json={"need": "Send SMS to +31612345678: Meeting moved to 3pm", "max_credits": 10},
         headers=auth_header(poster["api_key"]),
     )
     task_id = resp.json()["task_id"]
@@ -405,12 +435,18 @@ async def test_poster_approves_before_verification(client, db):
 async def test_poster_rejects_despite_verification_pass(client, db):
     """Poster can reject even after verification says it passed."""
     await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
-    worker = await _reg(client, "worker", good_at="translation")
+    worker = await _reg(client, "worker", good_at="data analysis, CSV, statistics")
     poster = await _reg(client, "poster")
 
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Reject override", "max_credits": 10},
+        json={
+            "need": (
+                "Analyze CSV dataset: distribution of revenue column,"
+                " correlation with marketing_spend"
+            ),
+            "max_credits": 10,
+        },
         headers=auth_header(poster["api_key"]),
     )
     task_id = resp.json()["task_id"]
@@ -434,9 +470,13 @@ async def test_poster_rejects_despite_verification_pass(client, db):
         await session.commit()
 
     # Poster rejects anyway
-    resp = await client.post(f"/v1/tasks/{task_id}/reject", headers=auth_header(poster["api_key"]))
+    resp = await client.post(
+        f"/v1/tasks/{task_id}/reject",
+        json={"reason": "Not satisfied"},
+        headers=auth_header(poster["api_key"]),
+    )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "posted"
+    assert resp.json()["status"] == "claimed"  # Worker keeps claim during grace period
 
 
 # ---------------------------------------------------------------------------
@@ -521,16 +561,19 @@ async def test_system_task_auto_approved_on_delivery(client, db):
 async def test_browse_pickup_abandon_cycle(client, db):
     """End-to-end: browse → pickup → abandon → browse again (task reappears)."""
     poster = await _reg(client, "poster")
-    worker = await _reg(client, "worker", good_at="Dutch translation")
+    worker = await _reg(client, "worker", good_at="license compliance, open source")
 
     # 1. Create task with context
     resp = await client.post(
         "/v1/tasks",
         json={
-            "need": "Translate annual report",
-            "context": "Financial document, formal tone",
+            "need": "Check license compatibility: lodash, express, react, tensorflow, ffmpeg",
+            "context": (
+                "Building a commercial SaaS product."
+                " Verify all deps are compatible with proprietary distribution."
+            ),
             "max_credits": 20,
-            "tags": ["dutch", "finance"],
+            "tags": ["license-check", "compliance"],
         },
         headers=auth_header(poster["api_key"]),
     )
@@ -539,22 +582,30 @@ async def test_browse_pickup_abandon_cycle(client, db):
 
     # 2. Worker browses available tasks
     resp = await client.get(
-        "/v1/tasks/available?tags=dutch",
+        "/v1/tasks/available?tags=license-check",
         headers=auth_header(worker["api_key"]),
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["total"] == 1
     assert data["tasks"][0]["task_id"] == task_id
-    assert data["tasks"][0]["context"] == "Financial document, formal tone"
-    assert data["tasks"][0]["tags"] == ["dutch", "finance"]
+    expected_ctx = (
+        "Building a commercial SaaS product."
+        " Verify all deps are compatible with proprietary distribution."
+    )
+    assert data["tasks"][0]["context"] == expected_ctx
+    assert data["tasks"][0]["tags"] == ["license-check", "compliance"]
 
     # 3. Worker picks up the task
     resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
     assert resp.status_code == 200
     picked = resp.json()
     assert picked["task_id"] == task_id
-    assert picked["context"] == "Financial document, formal tone"
+    picked_ctx = (
+        "Building a commercial SaaS product."
+        " Verify all deps are compatible with proprietary distribution."
+    )
+    assert picked["context"] == picked_ctx
 
     # 4. Task no longer appears in browse
     resp = await client.get(
@@ -585,7 +636,7 @@ async def test_browse_pickup_abandon_cycle(client, db):
     assert resp.json()["credits"] == 100
 
     # 8. Another worker can pick it up
-    worker2 = await _reg(client, "worker2", good_at="Dutch finance")
+    worker2 = await _reg(client, "worker2", good_at="license compliance, legal")
     resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker2["api_key"]))
     assert resp.status_code == 200
     assert resp.json()["task_id"] == task_id
@@ -595,15 +646,18 @@ async def test_browse_pickup_abandon_cycle(client, db):
 async def test_context_flows_through_matching_and_verification(client, db):
     """Context is included in matching and verification system task prompts."""
     infra = await _reg(client, "infra", good_at="matching", accepts_system_tasks=True)
-    worker = await _reg(client, "worker", good_at="Dutch translation")
+    worker = await _reg(client, "worker", good_at="legal analysis, contract review")
     poster = await _reg(client, "poster")
 
     # Create task with context
     resp = await client.post(
         "/v1/tasks",
         json={
-            "need": "Translate legal clause",
-            "context": "Contract for Dutch healthcare provider",
+            "need": "Review this SaaS agreement for red flags from a customer perspective",
+            "context": (
+                "Enterprise software contract with a US-based vendor."
+                " Focus on liability caps and data processing terms."
+            ),
             "max_credits": 15,
         },
         headers=auth_header(poster["api_key"]),
@@ -611,35 +665,69 @@ async def test_context_flows_through_matching_and_verification(client, db):
     assert resp.status_code == 201
     task_id = resp.json()["task_id"]
 
-    # Infra picks up match task — should contain context
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    assert resp.status_code == 200
-    assert "Contract for Dutch healthcare provider" in resp.json()["need"]
+    # Infra picks up match task — drain extraction tasks first
+    found_match = False
+    for _ in range(10):
+        resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+        if resp.status_code == 204:
+            break
+        data = resp.json()
+        if "Match agents for:" in data["need"]:
+            found_match = True
+            assert "Enterprise software contract" in data["need"]
+            match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
+            await client.post(
+                f"/v1/tasks/{data['task_id']}/deliver",
+                json={"result": match_result},
+                headers=auth_header(infra["api_key"]),
+            )
+            break
+        await client.post(
+            f"/v1/tasks/{data['task_id']}/deliver",
+            json={"result": json.dumps({"agent_id": "x", "tags": []})},
+            headers=auth_header(infra["api_key"]),
+        )
 
-    # Deliver match result
-    match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
-    await client.post(
-        f"/v1/tasks/{resp.json()['task_id']}/deliver",
-        json={"result": match_result},
-        headers=auth_header(infra["api_key"]),
-    )
+    assert found_match, "Expected match_agents task with context"
 
     # Worker picks up and delivers
     resp = await client.post("/v1/tasks/pickup", headers=auth_header(worker["api_key"]))
     assert resp.json()["task_id"] == task_id
-    assert resp.json()["context"] == "Contract for Dutch healthcare provider"
+    expected_legal_ctx = (
+        "Enterprise software contract with a US-based vendor."
+        " Focus on liability caps and data processing terms."
+    )
+    assert resp.json()["context"] == expected_legal_ctx
     await client.post(
         f"/v1/tasks/{task_id}/deliver",
-        json={"result": "Vertaling van juridische clausule"},
+        json={
+            "result": (
+                "Liability cap is 12 months fees (standard)."
+                " Data processing addendum missing EU SCCs."
+                " Recommend negotiating."
+            ),
+        },
         headers=auth_header(worker["api_key"]),
     )
 
-    # Infra picks up verification — should contain context
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    assert resp.status_code == 200
-    verify_need = resp.json()["need"]
-    assert "Verify completion" in verify_need
-    assert "Contract for Dutch healthcare provider" in verify_need
+    # Infra picks up verification — drain extraction tasks first
+    found_verify = False
+    for _ in range(5):
+        resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
+        if resp.status_code == 204:
+            break
+        data = resp.json()
+        if "Verify completion" in data["need"]:
+            found_verify = True
+            assert "Enterprise software contract" in data["need"]
+            break
+        await client.post(
+            f"/v1/tasks/{data['task_id']}/deliver",
+            json={"result": json.dumps({"agent_id": "x", "tags": []})},
+            headers=auth_header(infra["api_key"]),
+        )
+
+    assert found_verify, "Expected verify_completion task with context"
 
 
 @pytest.mark.asyncio
@@ -679,6 +767,9 @@ async def test_browse_matched_tasks_first(client, db):
     worker = await _reg(client, "worker", good_at="Dutch translation")
     poster = await _reg(client, "poster")
 
+    # Drain any extraction system tasks from registration
+    await _pickup_system_tasks(client, infra)
+
     # Create first task — will become broadcast after match expiry
     resp = await client.post(
         "/v1/tasks",
@@ -687,15 +778,8 @@ async def test_browse_matched_tasks_first(client, db):
     )
     broadcast_id = resp.json()["task_id"]
 
-    # Process match for first task — match nobody useful, then expire to broadcast
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    sys_id = resp.json()["task_id"]
-    match_result = json.dumps({"ranked_agents": []})
-    await client.post(
-        f"/v1/tasks/{sys_id}/deliver",
-        json={"result": match_result},
-        headers=auth_header(infra["api_key"]),
-    )
+    # Process match for first task — match nobody useful
+    await _pickup_system_tasks(client, infra)
 
     # Force broadcast by expiring match deadline
     async with db() as session:
@@ -713,14 +797,7 @@ async def test_browse_matched_tasks_first(client, db):
     matched_id = resp.json()["task_id"]
 
     # Process match for second task — match our worker
-    resp = await client.post("/v1/tasks/pickup", headers=auth_header(infra["api_key"]))
-    sys_id = resp.json()["task_id"]
-    match_result = json.dumps({"ranked_agents": [worker["agent_id"]]})
-    await client.post(
-        f"/v1/tasks/{sys_id}/deliver",
-        json={"result": match_result},
-        headers=auth_header(infra["api_key"]),
-    )
+    await _pickup_system_tasks(client, infra, worker_id=worker["agent_id"])
 
     # Worker browses — matched task should come first, broadcast second
     resp = await client.get("/v1/tasks/available", headers=auth_header(worker["api_key"]))

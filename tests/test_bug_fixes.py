@@ -60,11 +60,13 @@ async def test_reject_resets_expiry(client):
         headers=jhdr(worker["api_key"]),
         json={"result": "bad"},
     )
-    await client.post(f"/v1/tasks/{task_id}/reject", headers=hdr(poster["api_key"]))
+    await client.post(
+        f"/v1/tasks/{task_id}/reject", json={"reason": "Rejected"}, headers=hdr(poster["api_key"])
+    )
 
-    # Check expires_at was refreshed (task is back to posted)
+    # Task stays claimed during rejection grace period (worker keeps claim)
     resp = await client.get(f"/v1/tasks/{task_id}", headers=hdr(poster["api_key"]))
-    assert resp.json()["status"] == "posted"
+    assert resp.json()["status"] == "claimed"
 
 
 # --- Bug #3: tasks_completed only on approve ---
@@ -105,13 +107,13 @@ async def test_completed_count_only_on_approve(client):
 async def test_render_no_mutation(client):
     """Dict should be unchanged after render_response."""
     task = {
-        "id": "tk_test123",
+        "id": "tk-test123",
         "status": "delivered",
         "need": "test need",
         "result": "test result",
         "credits_charged": 5,
-        "poster_id": "ag_poster",
-        "worker_id": "ag_worker",
+        "poster_id": "ag-poster",
+        "worker_id": "ag-worker",
     }
     original = dict(task)
 
@@ -139,9 +141,9 @@ async def test_204_empty_body(registered_agent):
 def test_api_key_cryptographic():
     """API key should use secrets.token_urlsafe, have sufficient length."""
     key = api_key()
-    assert key.startswith("pk_")
-    # secrets.token_urlsafe(24) produces 32 chars of base64
-    assert len(key) >= 35  # pk_ + 32 chars
+    assert key.startswith("pwk-")
+    # secrets.token_urlsafe(32) produces 43 chars of base64
+    assert len(key) >= 47  # pwk- + 43 chars
 
 
 # --- Bug #6b: bcrypt hashing ---
@@ -151,7 +153,7 @@ def test_bcrypt_hashing():
     """Stored hash should be bcrypt, not SHA256."""
     import bcrypt
 
-    key = "pk_test_key_123"
+    key = "pwk-test_key_123"
     # Use real bcrypt directly to avoid fast_bcrypt test fixture
     h = bcrypt.hashpw(key.encode(), bcrypt.gensalt()).decode()
     assert h.startswith("$2b$"), f"Expected bcrypt hash, got: {h[:10]}"
@@ -232,13 +234,17 @@ async def test_tags_create_and_filter(client):
     resp = await client.post(
         "/v1/tasks",
         headers=jhdr(poster["api_key"]),
-        json={"need": "Translate text", "max_credits": 10, "tags": ["translation", "dutch"]},
+        json={
+            "need": "Review endpoint for SQL injection",
+            "max_credits": 10,
+            "tags": ["security-audit", "python"],
+        },
     )
     assert resp.status_code == 201
     task_id = resp.json()["task_id"]
 
     # Pickup with matching tag
-    resp = await client.post("/v1/tasks/pickup?tags=translation", headers=hdr(worker["api_key"]))
+    resp = await client.post("/v1/tasks/pickup?tags=security-audit", headers=hdr(worker["api_key"]))
     assert resp.status_code == 200
     assert resp.json()["task_id"] == task_id
 
@@ -252,10 +258,14 @@ async def test_pickup_no_matching_tags(client):
     await client.post(
         "/v1/tasks",
         headers=jhdr(poster["api_key"]),
-        json={"need": "Code review", "max_credits": 10, "tags": ["code"]},
+        json={
+            "need": "Run pytest suite against staging API and report failures",
+            "max_credits": 10,
+            "tags": ["testing"],
+        },
     )
 
-    resp = await client.post("/v1/tasks/pickup?tags=translation", headers=hdr(worker["api_key"]))
+    resp = await client.post("/v1/tasks/pickup?tags=security-audit", headers=hdr(worker["api_key"]))
     assert resp.status_code == 204
 
 

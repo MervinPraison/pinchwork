@@ -43,25 +43,40 @@ async def test_match_spawned_on_task_create(client, db):
     """When an infra agent exists, creating a task should spawn a match_agents system task."""
     poster = await register_agent(client, "poster")
     infra = await _register_infra_agent(client, "infra")
-    await _register_skilled_agent(client, "worker", "Dutch translation")
+    await _register_skilled_agent(client, "worker", "security auditing, OWASP")
 
     # Create a task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Translate document to Dutch", "max_credits": 10},
+        json={"need": "Review this API endpoint for injection vulnerabilities", "max_credits": 10},
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 201
 
-    # Infra agent should be able to pick up a system task
-    resp = await client.post(
-        "/v1/tasks/pickup",
-        headers=auth_header(infra["api_key"]),
-    )
-    assert resp.status_code == 200
-    pickup = resp.json()
-    assert "Match agents for:" in pickup["need"]
-    assert pickup["poster_id"] == settings.platform_agent_id
+    # Infra agent should be able to pick up a match_agents system task
+    # (drain any extract_capabilities tasks first)
+    found_match = False
+    for _ in range(10):
+        resp = await client.post(
+            "/v1/tasks/pickup",
+            headers=auth_header(infra["api_key"]),
+        )
+        if resp.status_code == 204:
+            break
+        pickup = resp.json()
+        if "Match agents for:" in pickup["need"]:
+            found_match = True
+            assert pickup["poster_id"] == settings.platform_agent_id
+            break
+        # Deliver non-match system tasks
+        import json
+
+        await client.post(
+            f"/v1/tasks/{pickup['task_id']}/deliver",
+            json={"result": json.dumps({"agent_id": "x", "tags": []})},
+            headers=auth_header(infra["api_key"]),
+        )
+    assert found_match, "Expected match_agents system task"
 
 
 @pytest.mark.asyncio
@@ -91,13 +106,13 @@ async def test_matched_agent_gets_priority(client, db):
     """After matching, the matched agent should see the task first."""
     poster = await register_agent(client, "poster")
     infra = await _register_infra_agent(client, "infra")
-    alice = await _register_skilled_agent(client, "alice", "Dutch translation")
-    bob = await _register_skilled_agent(client, "bob", "Python coding")
+    alice = await _register_skilled_agent(client, "alice", "security auditing, OWASP")
+    bob = await _register_skilled_agent(client, "bob", "image generation, DALL-E")
 
     # Create task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Translate to Dutch", "max_credits": 10},
+        json={"need": "Review this Python API for security vulnerabilities", "max_credits": 10},
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 201
@@ -198,14 +213,14 @@ async def test_conflict_rule_prevents_pickup(client, db):
     # Also give infra agent some skills so it could theoretically match
     resp = await client.patch(
         "/v1/me",
-        json={"good_at": "Dutch translation, matching, verification"},
+        json={"good_at": "security auditing, matching, verification"},
         headers=auth_header(infra["api_key"]),
     )
 
     # Create task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Translate to Dutch", "max_credits": 10},
+        json={"need": "Review this endpoint for auth bypass vulnerabilities", "max_credits": 10},
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 201
@@ -329,7 +344,11 @@ async def test_register_with_good_at(client, db):
     """Registration accepts good_at and accepts_system_tasks."""
     resp = await client.post(
         "/v1/register",
-        json={"name": "skilled", "good_at": "Dutch translation", "accepts_system_tasks": True},
+        json={
+            "name": "skilled",
+            "good_at": "Twilio SMS, email delivery",
+            "accepts_system_tasks": True,
+        },
         headers={"Accept": "application/json"},
     )
     assert resp.status_code == 201
@@ -339,7 +358,7 @@ async def test_register_with_good_at(client, db):
     resp = await client.get("/v1/me", headers=auth_header(data["api_key"]))
     assert resp.status_code == 200
     me = resp.json()
-    assert me["good_at"] == "Dutch translation"
+    assert me["good_at"] == "Twilio SMS, email delivery"
     assert me["accepts_system_tasks"] is True
 
 
@@ -348,12 +367,15 @@ async def test_full_matching_cycle(client, db):
     """End-to-end: create task, match, deliver match, matched agent picks up, delivers, approves."""
     poster = await register_agent(client, "poster")
     infra = await _register_infra_agent(client, "infra")
-    worker = await _register_skilled_agent(client, "worker", "Dutch translation")
+    worker = await _register_skilled_agent(client, "worker", "legal analysis, contract review")
 
     # 1. Create task
     resp = await client.post(
         "/v1/tasks",
-        json={"need": "Translate to Dutch", "max_credits": 20},
+        json={
+            "need": "Review this SaaS ToS for red flags from a customer perspective",
+            "max_credits": 20,
+        },
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 201
@@ -387,7 +409,12 @@ async def test_full_matching_cycle(client, db):
     # 5. Worker delivers
     resp = await client.post(
         f"/v1/tasks/{task_id}/deliver",
-        json={"result": "Dit is de Nederlandse vertaling."},
+        json={
+            "result": (
+                "Liability cap: 12 months fees (standard)."
+                " No auto-renewal. Arbitration in Delaware."
+            ),
+        },
         headers=auth_header(worker["api_key"]),
     )
     assert resp.status_code == 200

@@ -225,10 +225,11 @@ async def test_poster_can_reject_despite_verification_pass(client, db):
     # Poster rejects despite verification passing
     resp = await client.post(
         f"/v1/tasks/{task_id}/reject",
+        json={"reason": "Not what I wanted"},
         headers=auth_header(poster["api_key"]),
     )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "posted"
+    assert resp.json()["status"] == "claimed"  # Worker keeps claim during grace period
 
 
 @pytest.mark.asyncio
