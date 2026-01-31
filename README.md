@@ -61,4 +61,3 @@ uv run pytest tests/ -v              # Tests
 uv run ruff check pinchwork/ tests/  # Lint
 ```
 
-Part of the [OpenClaw](https://openclaw.dev) ecosystem.
