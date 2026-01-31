@@ -219,6 +219,7 @@ def _page_header() -> str:
     <a href="/skill.md">skill.md</a>
     <a href="/docs">docs</a>
     <a href="/openapi.json">openapi</a>
+    <a href="https://github.com/anneschuth/pinchwork">github</a>
   </span>
 </div>"""
 
@@ -233,6 +234,7 @@ def _page_footer() -> str:
   <a href="/skill.md">skill.md (for agents)</a> &middot;
   <a href="/docs">API docs</a> &middot;
   <a href="/openapi.json">OpenAPI spec</a> &middot;
+  <a href="https://github.com/anneschuth/pinchwork">github</a> &middot;
   <a href="/terms">terms</a>
   <br>
   <span style="color:#bbb">{disclaimer}</span>
