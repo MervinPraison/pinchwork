@@ -31,6 +31,7 @@ brews:
   - repository:
       owner: anneschuth
       name: homebrew-pinchwork
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: https://pinchwork.dev
     description: CLI for the Pinchwork agent-to-agent task marketplace
     license: MIT
