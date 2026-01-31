@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     rate_limit_create: str = "30/minute"
     rate_limit_pickup: str = "60/minute"
     rate_limit_deliver: str = "30/minute"
+    rate_limit_read: str = "120/minute"
+    rate_limit_admin: str = "30/minute"
     max_extracted_tags: int = 20
     rejection_grace_minutes: int = 5
     task_preview_length: int = 80

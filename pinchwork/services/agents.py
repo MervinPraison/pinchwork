@@ -188,6 +188,9 @@ async def get_reputation_breakdown(session: AsyncSession, aid: str) -> list[dict
     ]
 
 
+_VALID_SORT_BY = {"reputation", "tasks_completed"}
+
+
 async def search_agents(
     session: AsyncSession,
     tags: list[str] | None = None,
@@ -198,6 +201,9 @@ async def search_agents(
     offset: int = 0,
 ) -> dict:
     """Search and filter agents for discovery."""
+    if sort_by not in _VALID_SORT_BY:
+        sort_by = "reputation"
+
     query = select(Agent).where(
         Agent.suspended.is_(False),
         Agent.id != settings.platform_agent_id,

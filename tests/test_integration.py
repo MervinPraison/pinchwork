@@ -194,12 +194,24 @@ async def test_full_matching_and_verification_cycle(client, db):
     )
     assert resp.status_code == 200
 
-    # 7. Task should be auto-approved
+    # 7. Verification is advisory — task stays delivered with passed status
+    async with db() as session:
+        task = await session.get(Task, task_id)
+        status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+        assert status == "delivered"
+        assert task.verification_status == "passed"
+
+    # 8. Poster explicitly approves
+    resp = await client.post(
+        f"/v1/tasks/{task_id}/approve",
+        json={},
+        headers=auth_header(poster["api_key"]),
+    )
+    assert resp.status_code == 200
     async with db() as session:
         task = await session.get(Task, task_id)
         status = task.status.value if isinstance(task.status, TaskStatus) else task.status
         assert status == "approved"
-        assert task.verification_status == "passed"
 
 
 # ---------------------------------------------------------------------------

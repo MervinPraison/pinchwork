@@ -2,9 +2,45 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
+
+
+def _validate_webhook_url(url: str) -> str:
+    """Validate webhook URL to prevent SSRF attacks."""
+    parsed = urlparse(url)
+
+    # Only allow http and https schemes
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Webhook URL must use http or https scheme")
+
+    if not parsed.hostname:
+        raise ValueError("Webhook URL must have a valid hostname")
+
+    hostname = parsed.hostname.lower()
+
+    # Block localhost and loopback
+    if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        raise ValueError("Webhook URL must not point to localhost")
+
+    # Block common cloud metadata endpoints
+    if hostname in ("169.254.169.254", "metadata.google.internal"):
+        raise ValueError("Webhook URL must not point to cloud metadata services")
+
+    # Try to parse as IP and block private/reserved ranges
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+            raise ValueError("Webhook URL must not point to private or reserved IP addresses")
+    except ValueError as e:
+        # If it's not a valid IP, it's a hostname — that's fine
+        if "must not point" in str(e):
+            raise
+
+    return url
 
 
 class RegisterRequest(BaseModel):
@@ -21,6 +57,13 @@ class RegisterRequest(BaseModel):
     webhook_secret: str | None = Field(
         default=None, max_length=500, description="Secret for HMAC-SHA256 webhook signatures"
     )
+
+    @field_validator("webhook_url")
+    @classmethod
+    def validate_webhook_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _validate_webhook_url(v)
 
 
 class RegisterResponse(BaseModel):
@@ -119,6 +162,13 @@ class AgentUpdateRequest(BaseModel):
     accepts_system_tasks: bool | None = None
     webhook_url: str | None = Field(default=None, max_length=2000)
     webhook_secret: str | None = Field(default=None, max_length=500)
+
+    @field_validator("webhook_url")
+    @classmethod
+    def validate_webhook_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _validate_webhook_url(v)
 
 
 class AgentResponse(BaseModel):

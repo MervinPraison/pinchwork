@@ -97,8 +97,12 @@ async def test_verification_spawned_on_deliver(client, db):
 
 
 @pytest.mark.asyncio
-async def test_verification_passed_auto_approves(client, db):
-    """When verification passes, the parent task is auto-approved."""
+async def test_verification_passed_marks_status(client, db):
+    """When verification passes, the parent task stays delivered with passed status.
+
+    Verification is advisory — auto-approve happens via the 24h background job,
+    not immediately on verification pass. Poster always has final say.
+    """
     poster = await register_agent(client, "poster")
     worker = await register_agent(client, "worker")
     infra = await _register_infra_agent(client, "infra")
@@ -132,12 +136,25 @@ async def test_verification_passed_auto_approves(client, db):
         )
         assert resp.status_code == 200
 
-    # Check the parent task is auto-approved
+    # Verification is advisory: task stays delivered, verification_status is passed
     async with db() as session:
         task = await session.get(Task, task_id)
         status = task.status.value if isinstance(task.status, TaskStatus) else task.status
-        assert status == "approved", f"Expected approved, got {status}"
+        assert status == "delivered", f"Expected delivered, got {status}"
         assert task.verification_status == "passed"
+
+    # Poster can still explicitly approve
+    resp = await client.post(
+        f"/v1/tasks/{task_id}/approve",
+        json={},
+        headers=auth_header(poster["api_key"]),
+    )
+    assert resp.status_code == 200
+
+    async with db() as session:
+        task = await session.get(Task, task_id)
+        status = task.status.value if isinstance(task.status, TaskStatus) else task.status
+        assert status == "approved"
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent, verify_admin_key
+from pinchwork.config import settings
 from pinchwork.content import parse_body, render_response
 from pinchwork.database import get_db_session
 from pinchwork.db_models import Agent
@@ -15,6 +16,7 @@ from pinchwork.models import (
     CreditBalanceResponse,
     ErrorResponse,
 )
+from pinchwork.rate_limit import limiter
 from pinchwork.services.credits import (
     get_agent_stats,
     get_escrowed_balance,
@@ -30,12 +32,13 @@ router = APIRouter()
     response_model=CreditBalanceResponse,
     responses={401: {"model": ErrorResponse}},
 )
+@limiter.limit(settings.rate_limit_read)
 async def my_credits(
     request: Request,
     agent: Agent = AuthAgent,
     session=Depends(get_db_session),
-    offset: int = 0,
-    limit: int = 50,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
 ):
     ledger, total = await get_ledger(session, agent.id, offset=offset, limit=limit)
     escrowed = await get_escrowed_balance(session, agent.id)
@@ -60,6 +63,7 @@ async def my_stats(
 
 
 @router.post("/v1/admin/credits/grant")
+@limiter.limit(settings.rate_limit_admin)
 async def admin_grant(
     request: Request,
     _=Depends(verify_admin_key),

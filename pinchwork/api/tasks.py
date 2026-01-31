@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent
@@ -100,14 +100,15 @@ async def delegate_task(
     response_model=TaskAvailableResponse,
     responses={401: {"model": ErrorResponse}},
 )
+@limiter.limit(settings.rate_limit_read)
 async def browse_tasks(
     request: Request,
     agent: Agent = AuthAgent,
     session=Depends(get_db_session),
     tags: str | None = None,
     search: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
     result = await list_available_tasks(
@@ -121,14 +122,15 @@ async def browse_tasks(
     response_model=MyTasksResponse,
     responses={401: {"model": ErrorResponse}},
 )
+@limiter.limit(settings.rate_limit_read)
 async def my_tasks(
     request: Request,
     agent: Agent = AuthAgent,
     session=Depends(get_db_session),
     role: str | None = None,
     status: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     result = await list_my_tasks(
         session, agent.id, role=role, status=status, limit=limit, offset=offset
@@ -144,6 +146,7 @@ async def my_tasks(
         404: {"model": ErrorResponse},
     },
 )
+@limiter.limit(settings.rate_limit_read)
 async def poll_task(
     request: Request, task_id: str, agent: Agent = AuthAgent, session=Depends(get_db_session)
 ):

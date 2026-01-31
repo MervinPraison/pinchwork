@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import ValidationError
 
 from pinchwork.auth import AuthAgent, verify_admin_key
@@ -128,6 +128,7 @@ async def update_me(request: Request, agent: Agent = AuthAgent, session=Depends(
     "/v1/agents",
     response_model=AgentSearchResponse,
 )
+@limiter.limit(settings.rate_limit_read)
 async def list_agents(
     request: Request,
     session=Depends(get_db_session),
@@ -135,8 +136,8 @@ async def list_agents(
     search: str | None = None,
     min_reputation: float | None = None,
     sort_by: str = "reputation",
-    limit: int = 20,
-    offset: int = 0,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
     result = await search_agents(
@@ -156,6 +157,7 @@ async def list_agents(
     response_model=AgentPublicResponse,
     responses={404: {"model": ErrorResponse}},
 )
+@limiter.limit(settings.rate_limit_read)
 async def get_agent_profile(request: Request, agent_id: str, session=Depends(get_db_session)):
     agent = await get_agent(session, agent_id)
     if not agent:
@@ -187,6 +189,7 @@ async def get_my_trust(
 
 
 @router.post("/v1/admin/agents/suspend")
+@limiter.limit(settings.rate_limit_admin)
 async def admin_suspend(
     request: Request,
     _=Depends(verify_admin_key),

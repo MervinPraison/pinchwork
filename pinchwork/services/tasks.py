@@ -233,7 +233,35 @@ async def _process_match_result(session: AsyncSession, system_task: Task) -> Non
         session.add(parent)
         return
 
-    for rank, aid in enumerate(ranked_agents):
+    # Validate agent IDs: must exist, not be the poster, and no duplicates
+    if not isinstance(ranked_agents, list):
+        parent.match_status = MatchStatus.broadcast
+        session.add(parent)
+        return
+
+    ranked_agents = ranked_agents[:20]  # Cap to prevent abuse
+    unique_agents: list[str] = []
+    seen: set[str] = set()
+    for aid in ranked_agents:
+        if not isinstance(aid, str) or aid in seen or aid == parent.poster_id:
+            continue
+        seen.add(aid)
+        unique_agents.append(aid)
+
+    if not unique_agents:
+        parent.match_status = MatchStatus.broadcast
+        session.add(parent)
+        return
+
+    # Verify all agent IDs exist in database
+    valid_result = await session.execute(
+        select(Agent.id).where(Agent.id.in_(unique_agents))
+    )
+    valid_ids = {row[0] for row in valid_result.fetchall()}
+
+    for rank, aid in enumerate(unique_agents):
+        if aid not in valid_ids:
+            continue
         tm = TaskMatch(
             id=make_match_id(),
             task_id=parent.id,
@@ -270,9 +298,8 @@ async def _process_verify_result(session: AsyncSession, system_task: Task) -> No
     parent.verification_result = system_task.result
     if meets:
         parent.verification_status = VerificationStatus.passed
-        # Auto-approve if still in delivered state
-        if status_str(parent.status) == "delivered":
-            await finalize_task_approval(session, parent, settings.platform_fee_percent)
+        # Verification is advisory — poster always has final say.
+        # Auto-approve is handled by the 24h background job, not here.
     else:
         parent.verification_status = VerificationStatus.failed
 
@@ -335,8 +362,11 @@ async def _process_capability_result(session: AsyncSession, system_task: Task) -
     session.add(agent)
 
 
-async def finalize_task_approval(session: AsyncSession, task: Task, fee_percent: float) -> None:
-    """Common approval logic: pay worker with fee, refund remaining, mark approved."""
+async def _finalize_approval_credits(session: AsyncSession, task: Task, fee_percent: float) -> None:
+    """Credit-handling part of approval: pay worker with fee, refund remaining, increment stats.
+
+    The caller MUST have already atomically set status to 'approved'.
+    """
     credits = task.credits_charged or 0
     remaining = task.max_credits - credits
 
@@ -346,19 +376,38 @@ async def finalize_task_approval(session: AsyncSession, task: Task, fee_percent:
     if remaining > 0:
         await refund(session, task.id, task.poster_id, remaining)
 
-    task.status = TaskStatus.approved
-    session.add(task)
     await increment_tasks_completed(session, task.worker_id)
 
 
+async def finalize_task_approval(session: AsyncSession, task: Task, fee_percent: float) -> None:
+    """Atomically approve a task and release credits. Used by background jobs."""
+    # Atomic status transition to prevent double-payment
+    result = await session.execute(
+        text("UPDATE tasks SET status = 'approved' WHERE id = :id AND status = 'delivered'"),
+        {"id": task.id},
+    )
+    if result.rowcount == 0:
+        return  # Already approved or status changed — skip silently
+
+    await session.refresh(task)
+    await _finalize_approval_credits(session, task, fee_percent)
+
+
 async def finalize_system_task_approval(session: AsyncSession, task: Task) -> None:
-    """Approve a system task, paying the worker if present."""
+    """Atomically approve a system task, paying the worker if present."""
+    # Atomic status transition to prevent double-payment
+    result = await session.execute(
+        text("UPDATE tasks SET status = 'approved' WHERE id = :id AND status = 'delivered'"),
+        {"id": task.id},
+    )
+    if result.rowcount == 0:
+        return  # Already approved or status changed — skip silently
+
+    await session.refresh(task)
     credits = task.credits_charged or 0
     if task.worker_id:
         await release_to_worker(session, task.id, task.worker_id, credits)
         await increment_tasks_completed(session, task.worker_id)
-    task.status = TaskStatus.approved
-    session.add(task)
 
 
 # ---------------------------------------------------------------------------
@@ -713,9 +762,6 @@ async def deliver_task(
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = status_str(task.status)
-    if status != "claimed":
-        raise HTTPException(status_code=409, detail=f"Task is {status}, not claimed")
     if task.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
@@ -724,11 +770,25 @@ async def deliver_task(
         credits_claimed = task.max_credits
     actual_credits = min(credits_claimed, task.max_credits)
 
-    task.status = TaskStatus.delivered
-    task.result = result
-    task.credits_charged = actual_credits
-    task.delivered_at = datetime.now(UTC)
-    session.add(task)
+    # Atomic status transition to prevent concurrent delivery
+    deliver_result = await session.execute(
+        text(
+            "UPDATE tasks SET status = 'delivered', result = :result, "
+            "credits_charged = :credits, delivered_at = :now "
+            "WHERE id = :id AND status = 'claimed'"
+        ),
+        {
+            "result": result,
+            "credits": actual_credits,
+            "now": datetime.now(UTC).isoformat(),
+            "id": tid,
+        },
+    )
+    if deliver_result.rowcount == 0:
+        status = status_str(task.status)
+        raise HTTPException(status_code=409, detail=f"Task is {status}, not claimed")
+
+    await session.refresh(task)
 
     # Process system task results
     if task.is_system and task.system_task_type == SystemTaskType.match_agents:
@@ -779,13 +839,20 @@ async def approve_task(
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = status_str(task.status)
-    if status != "delivered":
-        raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
-    await finalize_task_approval(session, task, settings.platform_fee_percent)
+    # Atomic status transition to prevent double-payment
+    approve_result = await session.execute(
+        text("UPDATE tasks SET status = 'approved' WHERE id = :id AND status = 'delivered'"),
+        {"id": tid},
+    )
+    if approve_result.rowcount == 0:
+        status = status_str(task.status)
+        raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
+
+    await session.refresh(task)
+    await _finalize_approval_credits(session, task, settings.platform_fee_percent)
 
     # Optional rating
     if rating is not None:
@@ -830,29 +897,33 @@ async def reject_task(
     reason: str,
     feedback: str | None = None,
 ) -> dict:
-    """Reject delivery, reset task to posted with fresh expiry."""
+    """Reject delivery, reset task to claimed with grace period."""
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = status_str(task.status)
-    if status != "delivered":
-        raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
     if task.poster_id != poster_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
+    # Atomic status transition to prevent concurrent reject/approve race
+    grace_deadline = datetime.now(UTC) + timedelta(minutes=settings.rejection_grace_minutes)
+    reject_result = await session.execute(
+        text(
+            "UPDATE tasks SET status = 'claimed', result = NULL, "
+            "credits_charged = NULL, delivered_at = NULL, "
+            "rejection_reason = :reason, "
+            "rejection_count = COALESCE(rejection_count, 0) + 1, "
+            "rejection_grace_deadline = :grace "
+            "WHERE id = :id AND status = 'delivered'"
+        ),
+        {"reason": reason, "grace": grace_deadline.isoformat(), "id": tid},
+    )
+    if reject_result.rowcount == 0:
+        status = status_str(task.status)
+        raise HTTPException(status_code=409, detail=f"Task is {status}, not delivered")
+
     # Keep worker assigned during grace period so they can re-deliver
     rejected_worker_id = task.worker_id
-    grace_deadline = datetime.now(UTC) + timedelta(minutes=settings.rejection_grace_minutes)
-
-    task.status = TaskStatus.claimed
-    # worker_id stays set — worker keeps the claim during grace period
-    task.result = None
-    task.credits_charged = None
-    task.delivered_at = None
-    task.rejection_reason = reason
-    task.rejection_count = (task.rejection_count or 0) + 1
-    task.rejection_grace_deadline = grace_deadline
-    session.add(task)
+    await session.refresh(task)
 
     # Update trust poster→worker (negative)
     from pinchwork.services.trust import update_trust
@@ -894,21 +965,25 @@ async def cancel_task(session: AsyncSession, tid: str, poster_id: str) -> dict:
     task = await session.get(Task, tid)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    status = status_str(task.status)
-    if status != "posted":
+    if task.poster_id != poster_id:
+        raise HTTPException(status_code=403, detail="Not your task")
+
+    # Atomic status transition
+    cancel_result = await session.execute(
+        text("UPDATE tasks SET status = 'cancelled' WHERE id = :id AND status = 'posted'"),
+        {"id": tid},
+    )
+    if cancel_result.rowcount == 0:
+        status = status_str(task.status)
         raise HTTPException(
             status_code=409, detail=f"Task is {status}, can only cancel posted tasks"
         )
-    if task.poster_id != poster_id:
-        raise HTTPException(status_code=403, detail="Not your task")
 
     # Collect matched agent IDs before commit for SSE notification
     match_result = await session.execute(select(TaskMatch.agent_id).where(TaskMatch.task_id == tid))
     matched_agent_ids = [row[0] for row in match_result.fetchall()]
 
-    task.status = TaskStatus.cancelled
-    session.add(task)
-
+    await session.refresh(task)
     await refund(session, tid, poster_id, task.max_credits)
     await session.commit()
     cleanup_task_event(tid)
@@ -940,12 +1015,20 @@ async def abandon_task(session: AsyncSession, tid: str, worker_id: str) -> dict:
     if task.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Not your task")
 
-    task.status = TaskStatus.posted
-    task.worker_id = None
-    task.claimed_at = None
-    task.expires_at = datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)
-    task.match_status = MatchStatus.broadcast
-    session.add(task)
+    # Atomic status transition
+    new_expires = (datetime.now(UTC) + timedelta(hours=settings.task_expire_hours)).isoformat()
+    abandon_result = await session.execute(
+        text(
+            "UPDATE tasks SET status = 'posted', worker_id = NULL, claimed_at = NULL, "
+            "expires_at = :expires, match_status = 'broadcast' "
+            "WHERE id = :id AND status = 'claimed'"
+        ),
+        {"expires": new_expires, "id": tid},
+    )
+    if abandon_result.rowcount == 0:
+        raise HTTPException(status_code=409, detail="Task already changed status")
+
+    await session.refresh(task)
 
     # Track abandon on the worker
     worker = await session.get(Agent, worker_id)
@@ -1111,6 +1194,10 @@ async def list_available_tasks(
     return {"tasks": [_task_to_dict(t) for t in page], "total": total}
 
 
+_VALID_ROLES = {"poster", "worker"}
+_VALID_STATUSES = {s.value for s in TaskStatus}
+
+
 async def list_my_tasks(
     session: AsyncSession,
     agent_id: str,
@@ -1120,6 +1207,11 @@ async def list_my_tasks(
     offset: int = 0,
 ) -> dict:
     """List tasks where this agent is poster and/or worker."""
+    if role is not None and role not in _VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"Invalid role: {role}")
+    if status is not None and status not in _VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+
     queries = []
 
     if role in (None, "poster"):
