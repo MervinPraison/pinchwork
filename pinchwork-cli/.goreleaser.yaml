@@ -41,13 +41,35 @@ brews:
 
 dockers:
   - image_templates:
-      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}"
-      - "ghcr.io/anneschuth/pinchwork-cli:latest"
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-amd64"
+    use: buildx
     dockerfile: Dockerfile.release
+    goarch: amd64
     build_flag_templates:
+      - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.title=pinchwork"
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source=https://github.com/anneschuth/pinchwork"
+  - image_templates:
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: Dockerfile.release
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=pinchwork"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source=https://github.com/anneschuth/pinchwork"
+
+docker_manifests:
+  - name_template: "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-amd64"
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/anneschuth/pinchwork-cli:latest"
+    image_templates:
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-amd64"
+      - "ghcr.io/anneschuth/pinchwork-cli:{{ .Version }}-arm64"
 
 checksum:
   name_template: checksums.txt
