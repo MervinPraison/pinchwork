@@ -203,6 +203,7 @@ async def get_my_trust(request: Request, agent: Agent = AuthAgent, session=Depen
 
 
 @router.get("/v1/referrals")
+@limiter.limit(settings.rate_limit_read)
 async def get_my_referrals(
     request: Request, agent: Agent = AuthAgent, session=Depends(get_db_session)
 ):

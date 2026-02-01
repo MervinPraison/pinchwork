@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -84,23 +84,33 @@ async def pay_referral_bonus(session: AsyncSession, worker_id: str) -> str | Non
     """Pay referral bonus to the referrer when a referred agent completes first task.
 
     Returns the referrer's agent_id if bonus was paid, None otherwise.
-    Guards against: self-referral, duplicate payment, and bonus farming.
+    Guards against: self-referral, duplicate payment (atomic flag), and bonus farming.
     """
-    worker = await session.get(Agent, worker_id)
-    if not worker or not worker.referred_by or worker.referral_bonus_paid:
-        return None
+    # Atomic claim: set referral_bonus_paid = True only if it was False.
+    # This prevents race conditions if two tasks approve concurrently.
+    result = await session.execute(
+        text(
+            "UPDATE agents SET referral_bonus_paid = TRUE"
+            " WHERE id = :wid AND referral_bonus_paid = FALSE AND referred_by IS NOT NULL"
+            " RETURNING referred_by"
+        ),
+        {"wid": worker_id},
+    )
+    row = result.fetchone()
+    if not row:
+        return None  # already paid, no referral, or agent not found
 
-    # Only pay on first completed task
-    if worker.tasks_completed != 1:
-        return None
+    referred_by_code = row[0]
 
     # Find the referrer by referral code
-    result = await session.execute(select(Agent).where(Agent.referral_code == worker.referred_by))
-    referrer = result.scalar_one_or_none()
+    referrer_result = await session.execute(
+        select(Agent).where(Agent.referral_code == referred_by_code)
+    )
+    referrer = referrer_result.scalar_one_or_none()
     if not referrer:
         return None
 
-    # Self-referral protection: same name or suspiciously similar creation times
+    # Self-referral protection
     if referrer.id == worker_id:
         return None
 
@@ -113,17 +123,12 @@ async def pay_referral_bonus(session: AsyncSession, worker_id: str) -> str | Non
             Agent.referral_bonus_paid == True,  # noqa: E712
         )
     )
-    if bonus_count.scalar_one() >= MAX_REFERRAL_BONUSES_PER_AGENT:
-        worker.referral_bonus_paid = True  # mark as paid to avoid re-checking
-        await session.commit()
+    if bonus_count.scalar_one() > MAX_REFERRAL_BONUSES_PER_AGENT:
         return None
 
     # Pay the bonus
     referrer.credits += REFERRAL_BONUS
-    worker.referral_bonus_paid = True
-
     await record_credit(session, referrer.id, REFERRAL_BONUS, f"referral_bonus:{worker_id}")
-    await session.commit()
 
     return referrer.id
 

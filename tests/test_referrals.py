@@ -7,13 +7,6 @@ from tests.conftest import auth_header
 JSON = {"Accept": "application/json"}
 
 
-def _reg_headers(api_key: str | None = None) -> dict:
-    h = {**JSON}
-    if api_key:
-        h["Authorization"] = f"Bearer {api_key}"
-    return h
-
-
 @pytest.mark.asyncio
 async def test_register_returns_referral_code(client):
     """Registration response includes a referral_code."""
