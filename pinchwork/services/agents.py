@@ -22,12 +22,26 @@ async def register(
     accepts_system_tasks: bool = False,
     webhook_url: str | None = None,
     webhook_secret: str | None = None,
+    referral: str | None = None,
 ) -> dict:
     """Register a new agent. Returns agent_id and raw API key."""
     aid = agent_id()
     key = api_key()
     kh = hash_key(key)
     fp = key_fingerprint(key)
+    ref_code = f"ref-{aid[-8:]}"
+
+    # Determine if referral is a valid referral code or free-text source
+    referred_by: str | None = None
+    referral_source: str | None = None
+    if referral:
+        # Check if it matches a referral code pattern and exists
+        referrer = await session.execute(select(Agent).where(Agent.referral_code == referral))
+        referrer_agent = referrer.scalar_one_or_none()
+        if referrer_agent:
+            referred_by = referral
+        else:
+            referral_source = referral
 
     agent = Agent(
         id=aid,
@@ -39,6 +53,9 @@ async def register(
         accepts_system_tasks=accepts_system_tasks,
         webhook_url=webhook_url,
         webhook_secret=webhook_secret,
+        referral_code=ref_code,
+        referred_by=referred_by,
+        referral_source=referral_source,
     )
     session.add(agent)
 
@@ -51,7 +68,70 @@ async def register(
 
     await session.commit()
 
-    return {"agent_id": aid, "api_key": key, "credits": settings.initial_credits}
+    return {
+        "agent_id": aid,
+        "api_key": key,
+        "credits": settings.initial_credits,
+        "referral_code": ref_code,
+    }
+
+
+async def pay_referral_bonus(session: AsyncSession, worker_id: str) -> str | None:
+    """Pay referral bonus to the referrer when a referred agent completes first task.
+
+    Returns the referrer's agent_id if bonus was paid, None otherwise.
+    """
+    worker = await session.get(Agent, worker_id)
+    if not worker or not worker.referred_by or worker.referral_bonus_paid:
+        return None
+
+    # Only pay on first completed task
+    if worker.tasks_completed != 1:
+        return None
+
+    # Find the referrer by referral code
+    result = await session.execute(select(Agent).where(Agent.referral_code == worker.referred_by))
+    referrer = result.scalar_one_or_none()
+    if not referrer:
+        return None
+
+    # Pay the bonus
+    bonus = 10
+    referrer.credits += bonus
+    worker.referral_bonus_paid = True
+
+    await record_credit(session, referrer.id, bonus, f"referral_bonus:{worker_id}")
+    await session.commit()
+
+    return referrer.id
+
+
+async def get_referral_stats(session: AsyncSession, agent_id: str) -> dict:
+    """Get referral stats for an agent."""
+    agent = await session.get(Agent, agent_id)
+    if not agent:
+        return {"error": "Agent not found"}
+
+    # Count agents referred by this agent's code
+    result = await session.execute(
+        select(func.count()).select_from(Agent).where(Agent.referred_by == agent.referral_code)
+    )
+    total_referrals = result.scalar_one()
+
+    # Count bonus payments
+    result = await session.execute(
+        select(func.count())
+        .select_from(Agent)
+        .where(Agent.referred_by == agent.referral_code, Agent.referral_bonus_paid == True)  # noqa: E712
+    )
+    bonuses_paid = result.scalar_one()
+
+    return {
+        "referral_code": agent.referral_code,
+        "total_referrals": total_referrals,
+        "bonuses_earned": bonuses_paid,
+        "bonus_credits_earned": bonuses_paid * 10,
+    }
 
 
 async def get_agent(session: AsyncSession, aid: str) -> dict | None:

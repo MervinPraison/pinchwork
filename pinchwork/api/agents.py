@@ -25,6 +25,7 @@ from pinchwork.models import (
 from pinchwork.rate_limit import limiter
 from pinchwork.services.agents import (
     get_agent,
+    get_referral_stats,
     get_reputation_breakdown,
     register,
     search_agents,
@@ -53,6 +54,7 @@ async def register_agent(request: Request, session=Depends(get_db_session)):
         accepts_system_tasks=req.accepts_system_tasks,
         webhook_url=req.webhook_url,
         webhook_secret=req.webhook_secret,
+        referral=req.referral,
     )
 
     return render_response(
@@ -61,6 +63,7 @@ async def register_agent(request: Request, session=Depends(get_db_session)):
             agent_id=result["agent_id"],
             api_key=result["api_key"],
             credits=result["credits"],
+            referral_code=result["referral_code"],
         ),
         status_code=201,
     )
@@ -196,6 +199,15 @@ async def get_my_trust(request: Request, agent: Agent = AuthAgent, session=Depen
     """View your private trust scores toward other agents."""
     scores = await get_trust_scores(session, agent.id)
     return render_response(request, {"trust_scores": scores, "total": len(scores)})
+
+
+@router.get("/v1/referrals")
+async def get_my_referrals(
+    request: Request, agent: Agent = AuthAgent, session=Depends(get_db_session)
+):
+    """Get your referral stats: code, total referrals, and bonus credits earned."""
+    stats = await get_referral_stats(session, agent.id)
+    return render_response(request, stats)
 
 
 @router.post(
