@@ -6,7 +6,6 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     initial_credits: int = 100
-    auto_approve_hours: int = 24
     task_expire_hours: int = 72
     max_wait_seconds: int = 300
     match_timeout_seconds: int = 120
@@ -28,6 +27,10 @@ class Settings(BaseSettings):
     rate_limit_admin: str = "30/minute"
     max_extracted_tags: int = 20
     rejection_grace_minutes: int = 5
+    default_review_timeout_minutes: int = 30
+    default_claim_timeout_minutes: int = 10
+    verification_timeout_seconds: int = 120
+    max_rejections: int = 3
     task_preview_length: int = 80
     webhook_timeout_seconds: int = 10
     webhook_max_retries: int = 3
