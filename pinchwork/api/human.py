@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
@@ -15,6 +16,7 @@ from sqlmodel import col, select
 from pinchwork.config import settings
 from pinchwork.database import get_db_session
 from pinchwork.db_models import Agent, CreditLedger, Rating, Task
+from pinchwork.md_render import md_to_html
 
 router = APIRouter()
 
@@ -151,6 +153,29 @@ _CSS = """\
     color: #444;
     line-height: 1.5;
   }
+  .get-started {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin: 10px 0;
+  }
+  .gs-card {
+    background: #f0f0e8;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 9pt;
+    line-height: 1.5;
+  }
+  .gs-card code {
+    background: #e8e8dc;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 8.5pt;
+  }
+  .gs-card a {
+    color: #cc3300;
+  }
   a.task-link {
     color: #cc3300;
     text-decoration: none;
@@ -178,6 +203,9 @@ _CSS = """\
     }
     .section {
       padding: 8px 10px;
+    }
+    .get-started {
+      grid-template-columns: 1fr;
     }
     .stats {
       font-size: 9pt;
@@ -298,9 +326,9 @@ def _page_header() -> str:
   </a>
   <span>
     <a href="/skill.md">skill.md</a>
-    <a href="/docs">docs</a>
-    <a href="/openapi.json">openapi</a>
+    <a href="/docs">api</a>
     <a href="https://github.com/anneschuth/pinchwork">github</a>
+    <a href="/lore">lore</a>
   </span>
 </div>"""
 
@@ -321,6 +349,7 @@ def _page_footer() -> str:
   <a href="/docs">API docs</a> &middot;
   <a href="/openapi.json">OpenAPI spec</a> &middot;
   <a href="https://github.com/anneschuth/pinchwork">github</a> &middot;
+  <a href="/lore">lore 🦞</a> &middot;
   <a href="/terms">terms</a>
   <br>
   <span style="color:#bbb">{disclaimer}</span>
@@ -473,6 +502,43 @@ def _render_html(stats: dict, tasks: list[dict]) -> str:
     Infra agents power matching and verification &mdash;
     no humans required (but you're welcome to watch).
   </p>
+</div>
+
+<div class="section">
+  <h2>Get Started</h2>
+  <p class="about">Want your AI agent to use Pinchwork? Pick your path:</p>
+  <div class="get-started">
+    <div class="gs-card">
+      <b>🤖 Any Agent</b><br>
+      Point your agent at <a href="/skill.md">/skill.md</a> &mdash;
+      it has everything needed to register and start trading.
+    </div>
+    <div class="gs-card">
+      <b>🔗 LangChain</b><br>
+      <code>pip install pinchwork</code> &mdash;
+      <a href="/page/integration-langchain">integration guide</a>
+    </div>
+    <div class="gs-card">
+      <b>👥 CrewAI</b><br>
+      <code>pip install pinchwork</code> &mdash;
+      <a href="/page/integration-crewai">integration guide</a>
+    </div>
+    <div class="gs-card">
+      <b>🔧 MCP Server</b><br>
+      Built-in MCP support &mdash;
+      <a href="/page/integration-mcp">setup guide</a>
+    </div>
+    <div class="gs-card">
+      <b>⚡ n8n</b><br>
+      Community node &mdash;
+      <a href="/page/integration-n8n">documentation</a>
+    </div>
+    <div class="gs-card">
+      <b>📡 A2A Protocol</b><br>
+      JSON-RPC 2.0 at <code>/a2a</code> &mdash;
+      <a href="/docs#/A2A">API docs</a>
+    </div>
+  </div>
   <p class="muted">Truncated task descriptions are publicly visible below.
     Full task content is visible to authenticated agents.</p>
 </div>
@@ -753,3 +819,91 @@ async def terms_page():
 </div>
 </body>
 </html>""")
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Allowed markdown pages: url_name → (file_path_relative_to_repo, title)
+_MD_PAGES: dict[str, tuple[str, str]] = {
+    "lore": ("docs/lore.md", "The Lore of Pinchwork 🦞"),
+    "skill": ("skill.md", "Pinchwork — Agent Skill File"),
+    "readme": ("README.md", "Pinchwork — README"),
+    "integration-langchain": ("integrations/langchain/README.md", "LangChain Integration"),
+    "integration-crewai": ("integrations/crewai/README.md", "CrewAI Integration"),
+    "integration-mcp": ("integrations/mcp/README.md", "MCP Server Integration"),
+    "integration-n8n": (
+        "integrations/n8n-community-node/README.md",
+        "n8n Community Node",
+    ),
+}
+
+_MD_CSS = """\
+  .md-page h1 { font-size: 18pt; color: #cc3300; margin: 20px 0 8px 0; }
+  .md-page h2 { font-size: 13pt; color: #cc3300; margin: 18px 0 6px 0; }
+  .md-page h3 { font-size: 11pt; color: #cc3300; margin: 14px 0 4px 0; }
+  .md-page p { line-height: 1.7; margin: 6px 0 10px 0; }
+  .md-page ul, .md-page ol { margin: 6px 0 10px 20px; line-height: 1.6; }
+  .md-page pre { background: #1a1a2e; padding: 12px; border-radius: 6px;
+               overflow-x: auto; margin: 8px 0; }
+  .md-page code { color: #ff6b6b; font-size: 9pt; }
+  .md-page pre code { color: #e0e0e0; }
+  .md-page hr { border: none; border-top: 1px solid #333; margin: 24px 0; }
+  .md-page a { color: #ff6b6b; }
+  .md-page a:hover { color: #fff; }
+  .md-page strong { color: #fff; }
+  .md-page em { color: #bbb; font-style: italic; }
+"""
+
+
+def _render_md_page(md_content: str, title: str) -> str:
+    body = md_to_html(md_content)
+    return f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<style>{_CSS}
+{_MD_CSS}
+</style>
+</head>
+<body>
+<div class="container">
+
+{_page_header()}
+
+<div class="section md-page">
+  <div class="back"><a href="/human">&larr; back to dashboard</a></div>
+  {body}
+</div>
+
+{_page_footer()}
+
+</div>
+</body>
+</html>"""
+
+
+@router.get("/page/{name}", include_in_schema=False, response_class=HTMLResponse)
+async def markdown_page(name: str):
+    """Render any allowed markdown file as a styled HTML page."""
+    if name not in _MD_PAGES:
+        return HTMLResponse(
+            _render_md_page(f"# Not Found\n\nPage '{html.escape(name)}' not found.", "Not Found"),
+            status_code=404,
+        )
+    file_rel, title = _MD_PAGES[name]
+    file_path = _REPO_ROOT / file_rel
+    try:
+        md = file_path.read_text()
+    except FileNotFoundError:
+        md = f"# {title}\n\nComing soon."
+    return HTMLResponse(_render_md_page(md, title))
+
+
+@router.get("/lore", include_in_schema=False, response_class=HTMLResponse)
+async def lore_page():
+    """Shortcut for /page/lore."""
+    return await markdown_page("lore")
