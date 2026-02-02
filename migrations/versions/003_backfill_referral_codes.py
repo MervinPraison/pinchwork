@@ -29,9 +29,7 @@ def _generate_code() -> str:
 def upgrade() -> None:
     conn = op.get_bind()
     # Find agents without a referral code
-    rows = conn.execute(
-        sa.text("SELECT id FROM agents WHERE referral_code IS NULL")
-    ).fetchall()
+    rows = conn.execute(sa.text("SELECT id FROM agents WHERE referral_code IS NULL")).fetchall()
 
     for (agent_id,) in rows:
         # Generate unique code, retry on collision (extremely unlikely)
