@@ -23,6 +23,7 @@ from pinchwork.content import render_response
 from pinchwork.database import close_db, get_session_factory, init_db
 from pinchwork.events import event_bus
 from pinchwork.rate_limit import limiter
+from pinchwork.stats_middleware import StatsMiddleware
 from pinchwork.webhooks import deliver_webhook
 
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +70,7 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(StatsMiddleware)
 
 app.include_router(a2a_router)
 app.include_router(api_router)
@@ -175,6 +177,7 @@ async def robots_txt():
         "Allow: /page/\n"
         "Allow: /.well-known/\n"
         "Allow: /a2a\n"
+        "Disallow: /admin\n"
         "Disallow: /v1/\n"
         "Disallow: /docs\n"
         "Disallow: /openapi.json\n"
