@@ -56,8 +56,12 @@ crewai = [
     "crewai>=0.80.0",
     "httpx>=0.27.0",
 ]
+praisonai = [
+    "praisonaiagents>=1.4.1",
+    "httpx>=0.27.0",
+]
 all = [
-    "pinchwork[langchain,mcp,crewai]",
+    "pinchwork[langchain,mcp,crewai,praisonai]",
 ]
 dev = [
     "pytest>=8.0",
