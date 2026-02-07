@@ -38,7 +38,10 @@ _seeder_status = {
 
 def get_seeder_status() -> dict:
     """Return seeder health status for /health endpoint."""
-    return _seeder_status.copy()
+    status = _seeder_status.copy()
+    # Always read live config value, not cached status
+    status["enabled"] = settings.seed_marketplace_drip
+    return status
 
 
 # Agent personas (50 total)
@@ -407,11 +410,11 @@ def create_seeded_task(db, agent_ids: list[str]) -> None:
 
             # Fix #7: Actually credit platform agent
             if settings.platform_agent_id:
-                result = db.execute(
+                platform_update = db.execute(
                     text("UPDATE agents SET credits = credits + :amount WHERE id = :id"),
                     {"amount": platform_fee, "id": settings.platform_agent_id},
                 )
-                if result.rowcount == 0:
+                if platform_update.rowcount == 0:
                     logger.warning(
                         f"Platform agent {settings.platform_agent_id} not found, fee not collected"
                     )
@@ -594,7 +597,6 @@ async def drip_seeder_loop():
         db.close()
 
     logger.info("🦞 Marketplace seeder started (drip mode)")
-    _seeder_status["enabled"] = True
 
     reputation_update_counter = 0
 
